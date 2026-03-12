@@ -293,6 +293,225 @@ export interface AgentDebugDiagnosisEnvelopeV1 {
   generated_at: string
 }
 
+export type SupportEntitlementVerdict =
+  | 'allow'
+  | 'allow_with_notice'
+  | 'upgrade_required'
+  | 'budget_blocked'
+  | 'concurrency_blocked'
+  | 'escalate_required'
+
+export interface SupportRuntimeUsageV1 {
+  max_budget?: number | null
+  estimated_price?: number | null
+  current_concurrency?: number
+  queue_depth?: number
+  failed_intent_attempts?: number
+  policy_dispute?: boolean
+  billing_dispute?: boolean
+  persistent_runtime_failure?: boolean
+  included_credits_remaining?: number | null
+}
+
+export interface SupportLimitReasonV1 {
+  reason_code: string
+  title: string
+  detail: string
+  notice?: string | null
+  observed?: number | null
+  limit?: number | null
+  path_specific_cost_explain?: string | null
+}
+
+export interface SupportUpgradeHintV1 {
+  target_plan_id: string
+  reason: string
+  value_summary?: string | null
+  fallback_path?: string | null
+}
+
+export interface SupportEscalationHintV1 {
+  escalation_required: boolean
+  reason_code: string
+  suggested_channel: string
+  priority_class: string
+  handoff_summary: string
+  evidence_refs: string[]
+  next_update_eta: string
+}
+
+export interface SupportStepV1 {
+  step_id: string
+  surface: string
+  action: string
+  expected_result: string
+  fallback_if_failed: string
+  requires_confirmation: boolean
+}
+
+export interface SupportAskRequestV1 {
+  session_id: string
+  workspace_id: string
+  principal_id: string
+  intent_hint?: string | null
+  user_message: string
+  ui_surface: 'web' | 'android' | 'ios'
+  context_refs?: string[]
+  plan_id_hint?: string | null
+  pricing_path?: PricingPath
+  required_feature_gates?: string[]
+  runtime_usage?: SupportRuntimeUsageV1
+}
+
+export interface SupportAskResponseV1 {
+  intent_id: string
+  answer_type: 'explanation' | 'how_to' | 'escalation' | 'mixed'
+  summary: string
+  next_steps: SupportStepV1[]
+  entitlement_verdict: SupportEntitlementVerdict
+  limit_reason?: SupportLimitReasonV1 | null
+  required_feature_gates: string[]
+  upgrade_hint?: SupportUpgradeHintV1 | null
+  escalation_hint?: SupportEscalationHintV1 | null
+  resolved_plan_id: string
+  resolved_pricing_path: string
+}
+
+export interface SupportExplainLimitRequestV1 {
+  session_id: string
+  resource_type: string
+  current_usage?: SupportRuntimeUsageV1
+  requested_action: string
+  plan_id_hint?: string | null
+  pricing_path?: PricingPath
+  required_feature_gates?: string[]
+}
+
+export interface SupportExplainLimitResponseV1 {
+  entitlement_verdict: SupportEntitlementVerdict
+  limit_reason: SupportLimitReasonV1
+  unblock_options: string[]
+  path_specific_cost_explain: string
+  upgrade_hint?: SupportUpgradeHintV1 | null
+  escalation_hint?: SupportEscalationHintV1 | null
+  resolved_plan_id: string
+  resolved_pricing_path: string
+}
+
+export type CaseMemoryScope = 'user' | 'workspace' | 'platform_anonymized'
+export type CaseMemorySource =
+  | 'short_term'
+  | 'workspace_preference'
+  | 'redacted_feature'
+  | 'platform_anonymized'
+export type CaseMemoryRedactionLevel =
+  | 'raw_internal'
+  | 'redacted_v1'
+  | 'anonymized_k'
+export type CaseMemoryDeleteScope =
+  | 'session'
+  | 'user'
+  | 'workspace'
+  | 'time_range'
+export type CaseMemoryDeleteJobStatus =
+  | 'accepted'
+  | 'running'
+  | 'completed'
+  | 'failed'
+
+export interface CaseMemoryCandidateV1 {
+  memory_id: string
+  memory_key: string
+  memory_value: string
+  scope: CaseMemoryScope
+  memory_source: CaseMemorySource
+  redaction_level: CaseMemoryRedactionLevel
+  workspace_id?: string | null
+  principal_id?: string | null
+  session_id?: string | null
+  intent_tags: string[]
+  style_tags: string[]
+  constraint_tags: string[]
+  last_used_at: string
+}
+
+export interface CaseMemoryPolicyAppliedV1 {
+  learning_opt_out: boolean
+  retrieval_opt_out: boolean
+  platform_pattern_opt_out: boolean
+  retrieval_bypassed: boolean
+}
+
+export interface CaseMemoryQueryRequestV1 {
+  workspace_id: string
+  principal_id: string
+  session_id: string
+  intent_tags: string[]
+  style_tags?: string[]
+  constraint_tags?: string[]
+  limit?: number
+}
+
+export interface CaseMemoryQueryResponseV1 {
+  query_id: string
+  resolved_scopes: CaseMemoryScope[]
+  candidates: CaseMemoryCandidateV1[]
+  policy_applied: CaseMemoryPolicyAppliedV1
+}
+
+export interface CaseMemoryDeleteRequestV1 {
+  workspace_id: string
+  principal_id?: string | null
+  delete_scope: CaseMemoryDeleteScope
+  session_id?: string | null
+  from?: string | null
+  to?: string | null
+  reason?: string | null
+}
+
+export interface CaseMemoryDeleteAcceptedV1 {
+  delete_job_id: string
+  status: CaseMemoryDeleteJobStatus
+  accepted_at: string
+  requested_scope: CaseMemoryDeleteScope
+}
+
+export interface CaseMemoryDeleteStatusV1 {
+  delete_job_id: string
+  status: CaseMemoryDeleteJobStatus
+  requested_scope: CaseMemoryDeleteScope
+  accepted_at: string
+  updated_at: string
+  deleted_records_count: number
+  index_pruned_count: number
+  cutoff_from?: string | null
+  cutoff_to?: string | null
+  error_code?: string | null
+  error_message?: string | null
+}
+
+export interface CaseMemoryOptOutFlagsV1 {
+  learning_opt_out: boolean
+  retrieval_opt_out: boolean
+  platform_pattern_opt_out: boolean
+}
+
+export interface CaseMemoryOptOutUpdateRequestV1 {
+  workspace_id: string
+  principal_id: string
+  learning_opt_out: boolean
+  retrieval_opt_out: boolean
+  platform_pattern_opt_out: boolean
+}
+
+export interface CaseMemoryOptOutStateV1 {
+  workspace_id: string
+  principal_id: string
+  flags: CaseMemoryOptOutFlagsV1
+  effective_at?: string | null
+  updated_by?: string | null
+}
+
 export type MultimodalReviewRefType = 'image' | 'artifact' | 'log' | 'timeline'
 
 export interface MultimodalReviewRefV1 {
@@ -498,6 +717,12 @@ function withRequestContext(
     }
     if (context.principal_id) {
       headers['X-Flutty-Principal-Id'] = context.principal_id
+    }
+    if (context.workspace_id || context.principal_id) {
+      headers['X-Flutty-Principal-Context'] = JSON.stringify({
+        principal: context.principal_id ?? '',
+        tenant: context.workspace_id ?? ''
+      })
     }
     if (context.viewport) {
       headers['X-Flutty-Viewport'] = JSON.stringify(context.viewport)
@@ -984,5 +1209,114 @@ export function getAgentMultimodalReview(
     { method: 'GET' },
     requestContext,
     'Multimodal review API failed'
+  )
+}
+
+export function askAgentSupport(
+  request: SupportAskRequestV1,
+  requestContext?: AgentSessionRequestContext
+): Promise<SupportAskResponseV1> {
+  return requestAgentSessionApi<SupportAskResponseV1>(
+    '/v1/agent/support/ask',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    },
+    requestContext,
+    'Agent support API failed'
+  )
+}
+
+export function explainAgentSupportLimit(
+  request: SupportExplainLimitRequestV1,
+  requestContext?: AgentSessionRequestContext
+): Promise<SupportExplainLimitResponseV1> {
+  return requestAgentSessionApi<SupportExplainLimitResponseV1>(
+    '/v1/agent/support/explain-limit',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    },
+    requestContext,
+    'Agent support API failed'
+  )
+}
+
+export function queryAgentMemory(
+  request: CaseMemoryQueryRequestV1,
+  requestContext?: AgentSessionRequestContext
+): Promise<CaseMemoryQueryResponseV1> {
+  return requestAgentSessionApi<CaseMemoryQueryResponseV1>(
+    '/v1/agent/memory/query',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    },
+    requestContext,
+    'Agent memory API failed'
+  )
+}
+
+export function requestAgentMemoryDelete(
+  request: CaseMemoryDeleteRequestV1,
+  requestContext?: AgentSessionRequestContext
+): Promise<CaseMemoryDeleteAcceptedV1> {
+  return requestAgentSessionApi<CaseMemoryDeleteAcceptedV1>(
+    '/v1/agent/memory/delete',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    },
+    requestContext,
+    'Agent memory API failed'
+  )
+}
+
+export function getAgentMemoryDeleteStatus(
+  deleteJobId: string,
+  requestContext?: AgentSessionRequestContext
+): Promise<CaseMemoryDeleteStatusV1> {
+  return requestAgentSessionApi<CaseMemoryDeleteStatusV1>(
+    `/v1/agent/memory/delete/${encodeURIComponent(deleteJobId)}`,
+    { method: 'GET' },
+    requestContext,
+    'Agent memory API failed'
+  )
+}
+
+export function updateAgentMemoryOptOut(
+  request: CaseMemoryOptOutUpdateRequestV1,
+  requestContext?: AgentSessionRequestContext
+): Promise<CaseMemoryOptOutStateV1> {
+  return requestAgentSessionApi<CaseMemoryOptOutStateV1>(
+    '/v1/agent/memory/opt-out',
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    },
+    requestContext,
+    'Agent memory API failed'
+  )
+}
+
+export function getAgentMemoryOptOut(
+  workspaceId: string,
+  principalId: string,
+  requestContext?: AgentSessionRequestContext
+): Promise<CaseMemoryOptOutStateV1> {
+  const search = new URLSearchParams({
+    workspace_id: workspaceId,
+    principal_id: principalId
+  })
+  return requestAgentSessionApi<CaseMemoryOptOutStateV1>(
+    `/v1/agent/memory/opt-out?${search.toString()}`,
+    { method: 'GET' },
+    requestContext,
+    'Agent memory API failed'
   )
 }

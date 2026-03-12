@@ -132,7 +132,10 @@
                     <button
                       type="button"
                       class="rounded border border-interface-stroke px-2 py-1 text-[11px] hover:bg-black/5 disabled:opacity-50"
-                      :disabled="sessionState === 'loading'"
+                      :disabled="
+                        sessionState === 'loading' ||
+                        (highRiskVersionReasonRequired && isActionReasonEmpty)
+                      "
                       data-testid="flutty-agent-next-version-accept"
                       @click="acceptNextVersion"
                     >
@@ -141,7 +144,10 @@
                     <button
                       type="button"
                       class="rounded border border-interface-stroke px-2 py-1 text-[11px] hover:bg-black/5 disabled:opacity-50"
-                      :disabled="sessionState === 'loading'"
+                      :disabled="
+                        sessionState === 'loading' ||
+                        (highRiskVersionReasonRequired && isActionReasonEmpty)
+                      "
                       data-testid="flutty-agent-next-version-reject"
                       @click="rejectNextVersion"
                     >
@@ -175,6 +181,47 @@
                 </div>
               </div>
               <div
+                class="mt-2 rounded border border-interface-stroke bg-white/60 p-1.5 text-[11px]"
+                data-testid="flutty-agent-policy-gate-card"
+              >
+                <div class="font-semibold uppercase tracking-wide">Policy Gate</div>
+                <div class="mt-1">verdict: {{ policyGateVerdict ?? 'not-evaluated' }}</div>
+                <div v-if="policyGate?.reason_title" class="mt-1">
+                  reason: {{ policyGate.reason_title }}
+                </div>
+                <div class="mt-1 text-muted-foreground">
+                  {{
+                    policyGate?.reason_detail ??
+                    'Use Explain Gate to fetch entitlement verdict and limit reason.'
+                  }}
+                </div>
+                <div
+                  v-if="policyGate?.unblock_options && policyGate.unblock_options.length > 0"
+                  class="mt-1 text-muted-foreground"
+                >
+                  unblock: {{ policyGate.unblock_options.slice(0, 2).join(' | ') }}
+                </div>
+                <div v-if="policyGateError" class="mt-1 text-red-600">
+                  {{ policyGateError }}
+                </div>
+                <div
+                  v-if="standardizedError"
+                  class="mt-1 rounded border border-amber-200 bg-amber-50 px-1 py-0.5 text-amber-800"
+                  data-testid="flutty-agent-standardized-error"
+                >
+                  {{ standardizedError.code }}: {{ standardizedError.detail }}
+                </div>
+                <button
+                  type="button"
+                  class="mt-2 rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                  data-testid="flutty-agent-policy-refresh"
+                  :disabled="policyGateState === 'loading' || !sessionId"
+                  @click="refreshPolicy"
+                >
+                  Explain Gate
+                </button>
+              </div>
+              <div
                 v-if="executionEstimate"
                 class="mt-2 rounded border border-interface-stroke bg-white/60 p-1.5 text-[11px]"
                 data-testid="flutty-agent-estimate-card"
@@ -194,6 +241,27 @@
                 />
                 <span>确认提交（confirm gate）</span>
               </label>
+              <label class="mt-2 block text-[11px]" data-testid="flutty-agent-audit-reason-input">
+                <span>确认理由 / 审计说明</span>
+                <input
+                  type="text"
+                  class="mt-1 w-full rounded border border-interface-stroke bg-white/80 px-1.5 py-1 text-[11px]"
+                  :value="actionConfirmationReason"
+                  placeholder="高风险动作需要填写理由"
+                  @input="onActionReasonInput"
+                />
+              </label>
+              <div
+                v-if="
+                  highRiskGateReasonRequired ||
+                  highRiskVersionReasonRequired ||
+                  highRiskRevertReasonRequired
+                "
+                class="mt-1 rounded border border-amber-200 bg-amber-50 px-1.5 py-1 text-[11px] text-amber-800"
+                data-testid="flutty-agent-high-risk-reason-notice"
+              >
+                当前存在高风险动作，提交前请填写确认理由并留存审计。
+              </div>
               <div class="mt-2 flex flex-wrap gap-1 text-[11px]">
                 <button
                   type="button"
@@ -208,7 +276,11 @@
                   type="button"
                   class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
                   data-testid="flutty-agent-execution-submit"
-                  :disabled="!canSubmitEstimatedJob || executionState === 'submitting'"
+                  :disabled="
+                    !canSubmitEstimatedJob ||
+                    executionState === 'submitting' ||
+                    (highRiskGateReasonRequired && isActionReasonEmpty)
+                  "
                   @click="submitExecution"
                 >
                   Submit
@@ -299,7 +371,11 @@
                     type="button"
                     class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
                     data-testid="flutty-agent-diagnosis-revert"
-                    :disabled="!suggestedRevertVersionId || workflowVersionState === 'loading'"
+                    :disabled="
+                      !suggestedRevertVersionId ||
+                      workflowVersionState === 'loading' ||
+                      (highRiskRevertReasonRequired && isActionReasonEmpty)
+                    "
                     @click="revertFromDiagnostics"
                   >
                     Revert
@@ -334,12 +410,140 @@
                     type="button"
                     class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
                     data-testid="flutty-agent-review-revert"
-                    :disabled="!suggestedRevertVersionId || workflowVersionState === 'loading'"
+                    :disabled="
+                      !suggestedRevertVersionId ||
+                      workflowVersionState === 'loading' ||
+                      (highRiskRevertReasonRequired && isActionReasonEmpty)
+                    "
                     @click="revertFromDiagnostics"
                   >
                     Revert
                   </button>
                 </div>
+              </div>
+
+              <div
+                class="mt-3 border-t border-interface-stroke pt-2 text-[11px]"
+                data-testid="flutty-agent-memory-governance"
+              >
+                <div class="font-semibold uppercase tracking-wide">
+                  Memory Governance
+                </div>
+                <div class="mt-1 text-muted-foreground">
+                  workspace: {{ governanceWorkspaceId }} | principal:
+                  {{ governancePrincipalId }}
+                </div>
+                <div v-if="memoryError" class="mt-1 text-red-600">
+                  {{ memoryError }}
+                </div>
+                <div class="mt-2 grid grid-cols-1 gap-1">
+                  <label class="flex items-center gap-1">
+                    <input
+                      type="checkbox"
+                      :checked="memoryOptOutDraft.learning_opt_out"
+                      @change="onMemoryOptOutChange('learning_opt_out', $event)"
+                    />
+                    <span>learning_opt_out</span>
+                  </label>
+                  <label class="flex items-center gap-1">
+                    <input
+                      type="checkbox"
+                      :checked="memoryOptOutDraft.retrieval_opt_out"
+                      @change="onMemoryOptOutChange('retrieval_opt_out', $event)"
+                    />
+                    <span>retrieval_opt_out</span>
+                  </label>
+                  <label class="flex items-center gap-1">
+                    <input
+                      type="checkbox"
+                      :checked="memoryOptOutDraft.platform_pattern_opt_out"
+                      @change="onMemoryOptOutChange('platform_pattern_opt_out', $event)"
+                    />
+                    <span>platform_pattern_opt_out</span>
+                  </label>
+                </div>
+                <div class="mt-2 flex flex-wrap gap-1">
+                  <button
+                    type="button"
+                    class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                    data-testid="flutty-agent-memory-optout-load"
+                    :disabled="memoryState === 'loading'"
+                    @click="loadMemoryOptOut"
+                  >
+                    Load Opt-Out
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                    data-testid="flutty-agent-memory-optout-save"
+                    :disabled="memoryState === 'loading'"
+                    @click="saveMemoryOptOut"
+                  >
+                    Save Opt-Out
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                    data-testid="flutty-agent-memory-query"
+                    :disabled="memoryState === 'loading' || !sessionId"
+                    @click="queryMemory"
+                  >
+                    Query Memory
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                    data-testid="flutty-agent-memory-delete"
+                    :disabled="memoryState === 'loading'"
+                    @click="deleteMemory"
+                  >
+                    Delete User Memory
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                    data-testid="flutty-agent-memory-delete-refresh"
+                    :disabled="memoryState === 'loading' || !memoryDeleteStatus"
+                    @click="refreshMemoryDelete"
+                  >
+                    Refresh Delete
+                  </button>
+                </div>
+                <div v-if="memoryOptOut" class="mt-2 text-muted-foreground">
+                  opt_out_effective_at: {{ memoryOptOut.effective_at ?? 'pending' }}
+                </div>
+                <div v-if="memoryQuery" class="mt-1 text-muted-foreground">
+                  query_id: {{ memoryQuery.query_id }} | candidates:
+                  {{ memoryQuery.candidates.length }} | retrieval_bypassed:
+                  {{ memoryQuery.policy_applied.retrieval_bypassed }}
+                </div>
+                <div v-if="memoryDeleteStatus" class="mt-1 text-muted-foreground">
+                  delete_job: {{ memoryDeleteStatus.delete_job_id }} |
+                  status: {{ memoryDeleteStatus.status }} |
+                  deleted: {{ memoryDeleteStatus.deleted_records_count }}
+                </div>
+              </div>
+
+              <div
+                class="mt-3 rounded border border-interface-stroke bg-white/50 p-1.5 text-[11px]"
+                data-testid="flutty-agent-audit-trace"
+              >
+                <div class="font-semibold uppercase tracking-wide">Audit Trace</div>
+                <div v-if="actionAuditTrail.length === 0" class="mt-1 text-muted-foreground">
+                  no-audit-yet
+                </div>
+                <ul v-else class="mt-1 space-y-1">
+                  <li
+                    v-for="entry in actionAuditTrail.slice(0, 3)"
+                    :key="entry.audit_id"
+                    class="rounded border border-interface-stroke bg-white/60 px-1 py-0.5"
+                  >
+                    <div>{{ entry.action }} @ {{ entry.at }}</div>
+                    <div class="text-muted-foreground">
+                      reason: {{ entry.reason }} | trace: {{ entry.trace_ref ?? 'n/a' }}
+                    </div>
+                  </li>
+                </ul>
               </div>
 
               <div class="mt-3 border-t border-interface-stroke pt-2 text-xs">
@@ -497,6 +701,24 @@ const {
   reviewState,
   reviewError,
   review,
+  governanceWorkspaceId,
+  governancePrincipalId,
+  policyGateState,
+  policyGateError,
+  policyGate,
+  policyGateVerdict,
+  standardizedError,
+  memoryState,
+  memoryError,
+  memoryOptOut,
+  memoryOptOutDraft,
+  memoryQuery,
+  memoryDeleteStatus,
+  actionConfirmationReason,
+  actionAuditTrail,
+  highRiskGateReasonRequired,
+  highRiskVersionReasonRequired,
+  highRiskRevertReasonRequired,
   suggestedRevertVersionId,
   eventLog
 } = storeToRefs(store)
@@ -508,6 +730,14 @@ const {
   togglePinned,
   closeWindow,
   setExecutionConfirmationAccepted,
+  setActionConfirmationReason,
+  refreshPolicyGate,
+  refreshMemoryOptOutState,
+  setMemoryOptOutFlag,
+  updateMemoryOptOutState,
+  queryMemoryForCurrentSession,
+  requestMemoryDelete,
+  refreshMemoryDeleteStatus,
   estimateComfyWorkflowExecution,
   submitEstimatedExecution,
   refreshExecutionObservation,
@@ -571,6 +801,10 @@ const inspectHighlights = computed(() => {
   if (!Array.isArray(jobInspect.value?.timeline)) return []
   return jobInspect.value.timeline.slice(-3).reverse()
 })
+
+const isActionReasonEmpty = computed(
+  () => actionConfirmationReason.value.trim().length === 0
+)
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(Math.max(value, min), max)
@@ -642,6 +876,19 @@ function onExecutionConfirmationChange(event: Event) {
   setExecutionConfirmationAccepted(!!target?.checked)
 }
 
+function onActionReasonInput(event: Event) {
+  const target = event.target as HTMLInputElement | null
+  setActionConfirmationReason(target?.value ?? '')
+}
+
+function onMemoryOptOutChange(
+  key: 'learning_opt_out' | 'retrieval_opt_out' | 'platform_pattern_opt_out',
+  event: Event
+) {
+  const target = event.target as HTMLInputElement | null
+  setMemoryOptOutFlag(key, !!target?.checked)
+}
+
 async function createNewSession() {
   await store.createAndLoadSession()
 }
@@ -666,6 +913,10 @@ async function submitExecution() {
   await submitEstimatedExecution()
 }
 
+async function refreshPolicy() {
+  await refreshPolicyGate()
+}
+
 async function refreshExecution() {
   await refreshExecutionObservation()
 }
@@ -688,6 +939,26 @@ async function requestNextVersionFromReview() {
 
 async function revertFromDiagnostics() {
   await revertFromDiagnoseOrReview()
+}
+
+async function loadMemoryOptOut() {
+  await refreshMemoryOptOutState()
+}
+
+async function saveMemoryOptOut() {
+  await updateMemoryOptOutState()
+}
+
+async function queryMemory() {
+  await queryMemoryForCurrentSession()
+}
+
+async function deleteMemory() {
+  await requestMemoryDelete()
+}
+
+async function refreshMemoryDelete() {
+  await refreshMemoryDeleteStatus()
 }
 
 async function refreshWorkflowVersions() {

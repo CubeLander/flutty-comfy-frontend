@@ -317,7 +317,11 @@ describe('useFluttyAgentWindowStore', () => {
     )
     expect(store.nextWorkflowVersionProposal).toBeNull()
     expect(store.currentWorkflowVersionId).toBe('version-v2')
-    expect(store.eventLog[0].type).toBe('workflow-version-candidate-accepted')
+    expect(
+      store.eventLog.some(
+        (event) => event.type === 'workflow-version-candidate-accepted'
+      )
+    ).toBe(true)
   })
 
   it('rejects next workflow version candidate', async () => {
@@ -353,7 +357,11 @@ describe('useFluttyAgentWindowStore', () => {
       expect.objectContaining({ method: 'POST' })
     )
     expect(store.nextWorkflowVersionProposal).toBeNull()
-    expect(store.eventLog[0].type).toBe('workflow-version-candidate-rejected')
+    expect(
+      store.eventLog.some(
+        (event) => event.type === 'workflow-version-candidate-rejected'
+      )
+    ).toBe(true)
   })
 
   it('loads, switches, and rollbacks workflow versions', async () => {
@@ -462,6 +470,20 @@ describe('useFluttyAgentWindowStore', () => {
       )
       .mockResolvedValueOnce(
         asJsonResponse({
+          entitlement_verdict: 'allow',
+          limit_reason: {
+            reason_code: 'no_blocker',
+            title: 'No blocking limit detected',
+            detail: 'Current runtime usage fits policy limits.'
+          },
+          unblock_options: ['Continue'],
+          path_specific_cost_explain: 'hosted credits path',
+          resolved_plan_id: 'standard',
+          resolved_pricing_path: 'auto'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
           job_id: 'job-10d-success',
           status: 'queued',
           created_at: '2026-03-12T12:00:00.000Z',
@@ -535,21 +557,26 @@ describe('useFluttyAgentWindowStore', () => {
     )
     expect(mockFetchApi).toHaveBeenNthCalledWith(
       4,
-      '/v1/jobs',
+      '/v1/agent/support/explain-limit',
       expect.objectContaining({ method: 'POST' })
     )
     expect(mockFetchApi).toHaveBeenNthCalledWith(
       5,
+      '/v1/jobs',
+      expect.objectContaining({ method: 'POST' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      6,
       '/v1/jobs/job-10d-success',
       expect.objectContaining({ method: 'GET' })
     )
     expect(mockFetchApi).toHaveBeenNthCalledWith(
-      6,
+      7,
       '/v1/jobs/job-10d-success/inspect',
       expect.objectContaining({ method: 'GET' })
     )
     expect(mockFetchApi).toHaveBeenNthCalledWith(
-      7,
+      8,
       '/v1/jobs/job-10d-success/result',
       expect.objectContaining({ method: 'GET' })
     )
@@ -596,6 +623,20 @@ describe('useFluttyAgentWindowStore', () => {
             estimated_price: 2.1,
             confidence: 'medium'
           }
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          entitlement_verdict: 'allow',
+          limit_reason: {
+            reason_code: 'no_blocker',
+            title: 'No blocking limit detected',
+            detail: 'Current runtime usage fits policy limits.'
+          },
+          unblock_options: ['Continue'],
+          path_specific_cost_explain: 'hosted credits path',
+          resolved_plan_id: 'standard',
+          resolved_pricing_path: 'auto'
         })
       )
       .mockResolvedValueOnce(
@@ -838,6 +879,7 @@ describe('useFluttyAgentWindowStore', () => {
     await store.requestNextVersionProposalFromDiagnosis()
     await store.submitExecutionReview()
     await store.requestNextVersionProposalFromReview()
+    store.setActionConfirmationReason('review recommended rollback')
     await store.revertFromDiagnoseOrReview()
 
     expect(store.executionState).toBe('failed')
@@ -845,22 +887,22 @@ describe('useFluttyAgentWindowStore', () => {
     expect(store.review?.review_id).toBe('review-10d')
     expect(store.nextWorkflowVersionProposal?.candidate_version_id).toBe('version-v2')
     expect(mockFetchApi).toHaveBeenNthCalledWith(
-      8,
+      9,
       '/v1/agent/debug/diagnose',
       expect.objectContaining({ method: 'POST' })
     )
     expect(mockFetchApi).toHaveBeenNthCalledWith(
-      10,
+      11,
       '/v1/agent/sessions/session-10d-fail/reviews/multimodal',
       expect.objectContaining({ method: 'POST' })
     )
     expect(mockFetchApi).toHaveBeenNthCalledWith(
-      12,
+      13,
       '/v1/agent/sessions/session-10d-fail/messages',
       expect.objectContaining({ method: 'POST' })
     )
     expect(mockFetchApi).toHaveBeenNthCalledWith(
-      13,
+      14,
       '/v1/workflows/workflows%2Factive.json/versions/version-v1/rollback',
       expect.objectContaining({ method: 'POST' })
     )

@@ -12,6 +12,10 @@ import type {
   AgentMessageAppendRequest,
   AgentSessionRecord,
   AgentSessionRevisionConflict,
+  CaseMemoryDeleteStatusV1,
+  CaseMemoryOptOutFlagsV1,
+  CaseMemoryOptOutStateV1,
+  CaseMemoryQueryResponseV1,
   JobEstimateResponseV1,
   JobInspectResponseV1,
   JobResultResponseV1,
@@ -19,6 +23,8 @@ import type {
   JobStatusResponseV1,
   MultimodalReviewRequestV1,
   MultimodalReviewResponseV1,
+  SupportEntitlementVerdict,
+  SupportExplainLimitResponseV1,
   WorkflowVersionListResponse,
   WorkflowVersionRecord
 } from '@/stores/fluttyAgentSessionApi'
@@ -30,21 +36,28 @@ import {
   createAgentSession,
   createLocalSessionRevisionConflictError,
   diagnoseAgentExecution,
+  explainAgentSupportLimit,
   estimateAgentJob,
   getAgentJobResult,
+  getAgentMemoryDeleteStatus,
+  getAgentMemoryOptOut,
   getAgentJobStatus,
   getAgentMultimodalReview,
   getAgentSession,
   inspectAgentJob,
   isAgentSessionRevisionConflictError,
   listWorkflowVersions,
+  queryAgentMemory,
   rejectAgentAction,
+  requestAgentMemoryDelete,
   rollbackWorkflowVersion as rollbackWorkflowVersionApi,
   submitAgentMultimodalReview,
-  switchWorkflowVersion as switchWorkflowVersionApi
+  switchWorkflowVersion as switchWorkflowVersionApi,
+  updateAgentMemoryOptOut
 } from '@/stores/fluttyAgentSessionApi'
 
 const DEFAULT_WORKSPACE_ID = 'ws-comfyui-canvas'
+const DEFAULT_PRINCIPAL_ID = 'principal-comfyui-canvas'
 const PINNED_Z_INDEX = 3000
 const DEFAULT_POSITION = { x: 24, y: 96 }
 
@@ -71,6 +84,12 @@ export type FluttyAgentShellEventType =
   | 'job-inspect-observed'
   | 'job-diagnose-completed'
   | 'job-review-completed'
+  | 'policy-gate-refreshed'
+  | 'memory-opt-out-updated'
+  | 'memory-query-completed'
+  | 'memory-delete-requested'
+  | 'memory-delete-status-observed'
+  | 'audit-recorded'
   | 'workflow-version-candidate-accepted'
   | 'workflow-version-candidate-rejected'
   | 'workflow-versions-refreshed'
@@ -99,6 +118,46 @@ type JobExecutionState =
   | 'error'
 type DiagnoseState = 'idle' | 'loading' | 'ready' | 'error'
 type ReviewState = 'idle' | 'loading' | 'ready' | 'error'
+type PolicyGateState = 'idle' | 'loading' | 'ready' | 'error'
+type MemoryState = 'idle' | 'loading' | 'ready' | 'error'
+
+type PolicyBlockedVerdict =
+  | 'upgrade_required'
+  | 'budget_blocked'
+  | 'concurrency_blocked'
+  | 'escalate_required'
+
+interface StandardizedErrorExplanation {
+  code: string
+  title: string
+  detail: string
+  action_hint: string
+  policy_verdict: SupportEntitlementVerdict | null
+}
+
+interface PolicyGateSummary {
+  verdict: SupportEntitlementVerdict
+  reason_code: string | null
+  reason_title: string | null
+  reason_detail: string
+  unblock_options: string[]
+  resolved_plan_id: string | null
+  resolved_pricing_path: string | null
+  path_specific_cost_explain: string | null
+  source: 'support_explain_limit' | 'standardized_error'
+  updated_at: string
+}
+
+export interface ActionAuditRecord {
+  audit_id: string
+  action: string
+  reason: string
+  risk_level: string | null
+  requires_confirmation: boolean
+  trace_ref: string | null
+  at: string
+  metadata?: Record<string, unknown>
+}
 
 export interface NextWorkflowVersionProposal {
   action_id: string
@@ -220,6 +279,122 @@ function mapJobStatusToExecutionState(status: JobStatus): JobExecutionState {
   }
 }
 
+const KNOWN_STANDARDIZED_ERROR_CODES = new Set<string>([
+  'budget_blocked',
+  'concurrency_blocked',
+  'upgrade_required',
+  'escalate_required',
+  'inspect_not_ready',
+  'agent_session_revision_conflict'
+])
+
+function normalizeKnownErrorCode(rawCode: string | null): string | null {
+  if (!rawCode) return null
+  const normalized = rawCode.toLowerCase().trim()
+  for (const code of KNOWN_STANDARDIZED_ERROR_CODES) {
+    if (normalized === code || normalized.includes(code)) {
+      return code
+    }
+  }
+  if (
+    normalized.includes('insufficient_credits') ||
+    normalized.includes('quota_exceeded')
+  ) {
+    return 'budget_blocked'
+  }
+  if (normalized.includes('concurrency')) {
+    return 'concurrency_blocked'
+  }
+  return null
+}
+
+function isPolicyBlockedVerdict(
+  verdict: SupportEntitlementVerdict | null | undefined
+): verdict is PolicyBlockedVerdict {
+  return (
+    verdict === 'upgrade_required' ||
+    verdict === 'budget_blocked' ||
+    verdict === 'concurrency_blocked' ||
+    verdict === 'escalate_required'
+  )
+}
+
+function toPolicyBlockedReason(verdict: PolicyBlockedVerdict): string {
+  switch (verdict) {
+    case 'budget_blocked':
+      return 'Budget gate blocked this action. Lower execution cost or raise budget.'
+    case 'concurrency_blocked':
+      return 'Concurrency gate blocked this action. Wait for running jobs or reduce parallel submissions.'
+    case 'upgrade_required':
+      return 'Plan entitlement gate blocked this action. Upgrade plan or remove high-tier feature gates.'
+    case 'escalate_required':
+      return 'Policy requires human escalation before proceeding.'
+    default:
+      return 'Policy gate blocked this action.'
+  }
+}
+
+function buildStandardizedErrorExplanation(
+  code: string
+): StandardizedErrorExplanation | null {
+  switch (code) {
+    case 'budget_blocked':
+      return {
+        code,
+        title: 'Budget Blocked',
+        detail: 'Estimated cost exceeds current budget guardrail.',
+        action_hint: 'Lower cost settings or raise budget, then retry.',
+        policy_verdict: 'budget_blocked'
+      }
+    case 'concurrency_blocked':
+      return {
+        code,
+        title: 'Concurrency Blocked',
+        detail: 'Current concurrent jobs reached the plan limit.',
+        action_hint: 'Wait for active jobs to finish or reduce parallel submissions.',
+        policy_verdict: 'concurrency_blocked'
+      }
+    case 'upgrade_required':
+      return {
+        code,
+        title: 'Upgrade Required',
+        detail: 'Current plan does not include required capability gates.',
+        action_hint: 'Upgrade plan or switch to a lower-tier capability path.',
+        policy_verdict: 'upgrade_required'
+      }
+    case 'escalate_required':
+      return {
+        code,
+        title: 'Escalation Required',
+        detail: 'This action requires human support follow-up.',
+        action_hint: 'Create escalation evidence and hand off to support.',
+        policy_verdict: 'escalate_required'
+      }
+    case 'inspect_not_ready':
+      return {
+        code,
+        title: 'Inspect Not Ready',
+        detail: 'Execution inspection data is not ready yet.',
+        action_hint: 'Refresh execution status and retry after timeline is available.',
+        policy_verdict: null
+      }
+    case 'agent_session_revision_conflict':
+      return {
+        code,
+        title: 'Session Revision Conflict',
+        detail: 'Canvas revision changed since this session was bound.',
+        action_hint: 'Refresh session context and retry.',
+        policy_verdict: null
+      }
+    default:
+      return null
+  }
+}
+
+function isHighRiskLevel(level: string | null | undefined): boolean {
+  return level === 'high' || level === 'critical'
+}
+
 export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => {
   const { captureCanvasContextV1 } = useFluttyCanvasContextV1()
 
@@ -259,6 +434,28 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
   const reviewState = ref<ReviewState>('idle')
   const reviewError = ref<string | null>(null)
   const review = ref<MultimodalReviewResponseV1 | null>(null)
+  const governanceWorkspaceId = ref(
+    captureCanvasContextV1().workspace_id ?? DEFAULT_WORKSPACE_ID
+  )
+  const governancePrincipalId = ref(
+    captureCanvasContextV1().principal_id ?? DEFAULT_PRINCIPAL_ID
+  )
+  const policyGateState = ref<PolicyGateState>('idle')
+  const policyGateError = ref<string | null>(null)
+  const policyGate = ref<PolicyGateSummary | null>(null)
+  const standardizedError = ref<StandardizedErrorExplanation | null>(null)
+  const memoryState = ref<MemoryState>('idle')
+  const memoryError = ref<string | null>(null)
+  const memoryOptOut = ref<CaseMemoryOptOutStateV1 | null>(null)
+  const memoryOptOutDraft = ref<CaseMemoryOptOutFlagsV1>({
+    learning_opt_out: false,
+    retrieval_opt_out: false,
+    platform_pattern_opt_out: false
+  })
+  const memoryQuery = ref<CaseMemoryQueryResponseV1 | null>(null)
+  const memoryDeleteStatus = ref<CaseMemoryDeleteStatusV1 | null>(null)
+  const actionConfirmationReason = ref('')
+  const actionAuditTrail = ref<ActionAuditRecord[]>([])
 
   const nextWorkflowVersionProposal = computed<NextWorkflowVersionProposal | null>(
     () => {
@@ -271,11 +468,39 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     }
   )
 
+  const policyGateVerdict = computed<SupportEntitlementVerdict | null>(
+    () => policyGate.value?.verdict ?? standardizedError.value?.policy_verdict ?? null
+  )
+
+  const policyGateBlocked = computed(() =>
+    isPolicyBlockedVerdict(policyGateVerdict.value)
+  )
+
+  const highRiskGateReasonRequired = computed(
+    () => policyGateVerdict.value === 'allow_with_notice'
+  )
+
+  const highRiskVersionReasonRequired = computed(() =>
+    isHighRiskLevel(nextWorkflowVersionProposal.value?.risk_level ?? null)
+  )
+
+  const highRiskRevertReasonRequired = computed(() => {
+    if (isHighRiskLevel(diagnosis.value?.risk.level)) return true
+    return (
+      review.value?.recommended_actions.some(
+        (action) =>
+          action.requires_confirmation ||
+          isHighRiskLevel(action.risk_level)
+      ) ?? false
+    )
+  })
+
   const canSubmitEstimatedJob = computed(
     () =>
       executionState.value === 'estimate-ready' &&
       executionConfirmationAccepted.value &&
-      !!workflowId.value
+      !!workflowId.value &&
+      !policyGateBlocked.value
   )
 
   const canDiagnoseExecution = computed(
@@ -338,6 +563,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
 
   function clearExecutionError() {
     executionError.value = null
+    clearStandardizedError()
   }
 
   function clearDiagnosisState() {
@@ -403,6 +629,169 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     }
   }
 
+  function syncGovernanceIdentityFromContext() {
+    const context = captureCanvasContextV1()
+    governanceWorkspaceId.value = context.workspace_id ?? DEFAULT_WORKSPACE_ID
+    governancePrincipalId.value = context.principal_id ?? DEFAULT_PRINCIPAL_ID
+  }
+
+  function clearPolicyGateError() {
+    policyGateError.value = null
+  }
+
+  function clearMemoryError() {
+    memoryError.value = null
+  }
+
+  function clearStandardizedError() {
+    standardizedError.value = null
+  }
+
+  function setPolicyGateFromExplainLimit(
+    response: SupportExplainLimitResponseV1
+  ) {
+    policyGate.value = {
+      verdict: response.entitlement_verdict,
+      reason_code: response.limit_reason.reason_code,
+      reason_title: response.limit_reason.title,
+      reason_detail: response.limit_reason.detail,
+      unblock_options: [...response.unblock_options],
+      resolved_plan_id: response.resolved_plan_id,
+      resolved_pricing_path: response.resolved_pricing_path,
+      path_specific_cost_explain:
+        response.path_specific_cost_explain ??
+        response.limit_reason.path_specific_cost_explain ??
+        null,
+      source: 'support_explain_limit',
+      updated_at: new Date().toISOString()
+    }
+  }
+
+  function setPolicyGateFromStandardizedError(
+    explanation: StandardizedErrorExplanation
+  ) {
+    if (!explanation.policy_verdict) return
+    policyGate.value = {
+      verdict: explanation.policy_verdict,
+      reason_code: explanation.code,
+      reason_title: explanation.title,
+      reason_detail: explanation.detail,
+      unblock_options: [explanation.action_hint],
+      resolved_plan_id: null,
+      resolved_pricing_path: null,
+      path_specific_cost_explain: null,
+      source: 'standardized_error',
+      updated_at: new Date().toISOString()
+    }
+    policyGateState.value = 'ready'
+    policyGateError.value = null
+  }
+
+  function resolveApiErrorCode(error: unknown): string | null {
+    if (error instanceof AgentSessionApiError) {
+      const payload = asRecord(error.payload)
+      const code = normalizeKnownErrorCode(
+        asString(payload?.code) ?? asString(payload?.error_code)
+      )
+      if (code) return code
+      const detailCode = normalizeKnownErrorCode(asString(payload?.detail))
+      if (detailCode) return detailCode
+      return normalizeKnownErrorCode(error.message)
+    }
+    if (error instanceof Error) {
+      return normalizeKnownErrorCode(error.message)
+    }
+    return null
+  }
+
+  function resolveStandardizedErrorMessage(
+    error: unknown,
+    fallbackMessage: string
+  ): string {
+    const errorCode = resolveApiErrorCode(error)
+    if (!errorCode) {
+      clearStandardizedError()
+      return error instanceof Error ? error.message : fallbackMessage
+    }
+
+    const explanation = buildStandardizedErrorExplanation(errorCode)
+    if (!explanation) {
+      clearStandardizedError()
+      return error instanceof Error ? error.message : fallbackMessage
+    }
+
+    standardizedError.value = explanation
+    setPolicyGateFromStandardizedError(explanation)
+    return `${explanation.title}: ${explanation.detail} ${explanation.action_hint}`
+  }
+
+  function resolveActionReason(
+    action: string,
+    options: {
+      required: boolean
+      fallbackReason: string
+    }
+  ): string {
+    const { required, fallbackReason } = options
+    const reason = actionConfirmationReason.value.trim()
+    if (required && !reason) {
+      throw new Error(
+        `Confirmation reason is required for high-risk action: ${action}.`
+      )
+    }
+    actionConfirmationReason.value = ''
+    return reason || fallbackReason
+  }
+
+  function appendAuditRecord(record: ActionAuditRecord) {
+    actionAuditTrail.value.unshift(record)
+    if (actionAuditTrail.value.length > 20) {
+      actionAuditTrail.value.length = 20
+    }
+    emitShellEvent('audit-recorded', {
+      audit_id: record.audit_id,
+      action: record.action,
+      risk_level: record.risk_level,
+      requires_confirmation: record.requires_confirmation,
+      trace_ref: record.trace_ref
+    })
+  }
+
+  function recordActionAudit(
+    action: string,
+    {
+      reason,
+      riskLevel = null,
+      requiresConfirmation = false,
+      traceRef = null,
+      metadata
+    }: {
+      reason: string
+      riskLevel?: string | null
+      requiresConfirmation?: boolean
+      traceRef?: string | null
+      metadata?: Record<string, unknown>
+    }
+  ) {
+    appendAuditRecord({
+      audit_id: newEphemeralId('audit'),
+      action,
+      reason,
+      risk_level: riskLevel,
+      requires_confirmation: requiresConfirmation,
+      trace_ref: traceRef,
+      at: new Date().toISOString(),
+      metadata
+    })
+  }
+
+  function applyMemoryOptOutState(nextState: CaseMemoryOptOutStateV1) {
+    memoryOptOut.value = nextState
+    memoryOptOutDraft.value = {
+      ...nextState.flags
+    }
+  }
+
   function handleSessionError(
     stage: string,
     error: unknown,
@@ -422,7 +811,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     }
 
     clearSessionConflict()
-    sessionError.value = error instanceof Error ? error.message : fallbackMessage
+    sessionError.value = resolveStandardizedErrorMessage(error, fallbackMessage)
     emitShellEvent('session-error', { stage })
   }
 
@@ -446,8 +835,10 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     }
 
     clearWorkflowVersionConflict()
-    workflowVersionError.value =
-      error instanceof Error ? error.message : fallbackMessage
+    workflowVersionError.value = resolveStandardizedErrorMessage(
+      error,
+      fallbackMessage
+    )
     emitShellEvent('session-error', {
       stage,
       scope: 'workflow-version'
@@ -460,7 +851,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     fallbackMessage: string
   ) {
     executionState.value = 'error'
-    executionError.value = error instanceof Error ? error.message : fallbackMessage
+    executionError.value = resolveStandardizedErrorMessage(error, fallbackMessage)
     emitShellEvent('session-error', {
       stage,
       scope: 'job-execution'
@@ -469,7 +860,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
 
   function handleDiagnoseError(error: unknown, fallbackMessage: string) {
     diagnoseState.value = 'error'
-    diagnosisError.value = error instanceof Error ? error.message : fallbackMessage
+    diagnosisError.value = resolveStandardizedErrorMessage(error, fallbackMessage)
     emitShellEvent('session-error', {
       stage: 'job_diagnose',
       scope: 'job-execution'
@@ -478,7 +869,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
 
   function handleReviewError(error: unknown, fallbackMessage: string) {
     reviewState.value = 'error'
-    reviewError.value = error instanceof Error ? error.message : fallbackMessage
+    reviewError.value = resolveStandardizedErrorMessage(error, fallbackMessage)
     emitShellEvent('session-error', {
       stage: 'job_review',
       scope: 'job-execution'
@@ -550,6 +941,11 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     bringToFront()
     emitShellEvent('window-opened')
     await ensureSessionReady()
+    try {
+      await refreshMemoryOptOutState()
+    } catch {
+      // keep shell usable even when memory governance endpoints are unavailable
+    }
   }
 
   async function toggleWindow() {
@@ -583,6 +979,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     sessionState.value = 'creating'
     sessionError.value = null
     clearSessionConflict()
+    syncGovernanceIdentityFromContext()
     resetExecutionLoop()
 
     try {
@@ -598,6 +995,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
       sessionState.value = 'ready'
       bindSessionRevision()
       syncWorkflowIdFromContext()
+      syncGovernanceIdentityFromContext()
       emitShellEvent('session-created', { session_id: created.session_id })
       return created
     } catch (error) {
@@ -614,6 +1012,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     sessionState.value = 'loading'
     sessionError.value = null
     clearSessionConflict()
+    syncGovernanceIdentityFromContext()
 
     try {
       const fetched = await getAgentSession(targetSessionId, buildRequestContext())
@@ -622,6 +1021,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
       sessionState.value = 'ready'
       bindSessionRevision()
       syncWorkflowIdFromContext()
+      syncGovernanceIdentityFromContext()
       emitShellEvent('session-fetched', { session_id: fetched.session_id })
       return fetched
     } catch (error) {
@@ -699,12 +1099,330 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     jobStatus.value = null
     jobResult.value = null
     jobInspect.value = null
+    policyGateState.value = 'idle'
+    policyGateError.value = null
+    policyGate.value = null
+    clearStandardizedError()
     clearDiagnosisState()
     clearReviewState()
   }
 
   function setExecutionConfirmationAccepted(accepted: boolean) {
     executionConfirmationAccepted.value = accepted
+  }
+
+  function setActionConfirmationReason(reason: string) {
+    actionConfirmationReason.value = reason
+  }
+
+  function setMemoryOptOutFlag(
+    key: keyof CaseMemoryOptOutFlagsV1,
+    enabled: boolean
+  ) {
+    memoryOptOutDraft.value = {
+      ...memoryOptOutDraft.value,
+      [key]: enabled
+    }
+  }
+
+  function buildPolicyRuntimeUsage() {
+    const estimatedPrice =
+      executionEstimate.value?.estimate.estimated_price ?? undefined
+    const currentConcurrency =
+      activeJobStatus.value === 'running' || activeJobStatus.value === 'queued'
+        ? 1
+        : 0
+    const queueDepth = activeJobStatus.value === 'queued' ? 1 : 0
+
+    return {
+      max_budget: estimatedPrice,
+      estimated_price: estimatedPrice,
+      current_concurrency: currentConcurrency,
+      queue_depth: queueDepth
+    }
+  }
+
+  function resolvePricingPathForPolicy(): 'auto' | 'hosted' | 'byok' {
+    const pricingPath = executionEstimate.value?.pricing.pricing_path
+    if (pricingPath === 'hosted' || pricingPath === 'byok') return pricingPath
+    return 'auto'
+  }
+
+  async function refreshPolicyGate(resourceType = 'execution') {
+    const currentSessionId = sessionId.value
+    if (!currentSessionId) {
+      throw new Error('Session id is required before policy gate refresh.')
+    }
+
+    syncGovernanceIdentityFromContext()
+    policyGateState.value = 'loading'
+    clearPolicyGateError()
+
+    try {
+      const response = await explainAgentSupportLimit(
+        {
+          session_id: currentSessionId,
+          resource_type: resourceType,
+          requested_action: 'submit comfy workflow execution',
+          current_usage: buildPolicyRuntimeUsage(),
+          plan_id_hint: executionEstimate.value?.pricing.plan_id ?? undefined,
+          pricing_path: resolvePricingPathForPolicy()
+        },
+        buildRequestContext()
+      )
+      setPolicyGateFromExplainLimit(response)
+      policyGateState.value = 'ready'
+      emitShellEvent('policy-gate-refreshed', {
+        session_id: currentSessionId,
+        verdict: response.entitlement_verdict,
+        reason_code: response.limit_reason.reason_code
+      })
+      return response
+    } catch (error) {
+      policyGateState.value = 'error'
+      policyGateError.value = resolveStandardizedErrorMessage(
+        error,
+        'Failed to refresh policy gate.'
+      )
+      emitShellEvent('session-error', {
+        stage: 'policy_gate_refresh',
+        scope: 'policy-gate'
+      })
+      throw error
+    }
+  }
+
+  async function refreshMemoryOptOutState() {
+    syncGovernanceIdentityFromContext()
+    memoryState.value = 'loading'
+    clearMemoryError()
+
+    try {
+      const response = await getAgentMemoryOptOut(
+        governanceWorkspaceId.value,
+        governancePrincipalId.value,
+        buildRequestContext()
+      )
+      applyMemoryOptOutState(response)
+      memoryState.value = 'ready'
+      emitShellEvent('memory-opt-out-updated', {
+        workspace_id: response.workspace_id,
+        principal_id: response.principal_id,
+        effective_at: response.effective_at
+      })
+      return response
+    } catch (error) {
+      memoryState.value = 'error'
+      memoryError.value = resolveStandardizedErrorMessage(
+        error,
+        'Failed to load memory opt-out state.'
+      )
+      emitShellEvent('session-error', {
+        stage: 'memory_opt_out_get',
+        scope: 'memory-governance'
+      })
+      throw error
+    }
+  }
+
+  async function updateMemoryOptOutState(reason?: string) {
+    syncGovernanceIdentityFromContext()
+    memoryState.value = 'loading'
+    clearMemoryError()
+
+    try {
+      const response = await updateAgentMemoryOptOut(
+        {
+          workspace_id: governanceWorkspaceId.value,
+          principal_id: governancePrincipalId.value,
+          learning_opt_out: memoryOptOutDraft.value.learning_opt_out,
+          retrieval_opt_out: memoryOptOutDraft.value.retrieval_opt_out,
+          platform_pattern_opt_out:
+            memoryOptOutDraft.value.platform_pattern_opt_out
+        },
+        buildRequestContext()
+      )
+      applyMemoryOptOutState(response)
+      memoryState.value = 'ready'
+      const auditReason = reason?.trim() || 'memory_opt_out_update'
+      recordActionAudit('memory_opt_out_update', {
+        reason: auditReason,
+        riskLevel: 'low',
+        requiresConfirmation: false,
+        traceRef: response.effective_at ?? null,
+        metadata: {
+          flags: response.flags
+        }
+      })
+      emitShellEvent('memory-opt-out-updated', {
+        workspace_id: response.workspace_id,
+        principal_id: response.principal_id,
+        effective_at: response.effective_at
+      })
+      return response
+    } catch (error) {
+      memoryState.value = 'error'
+      memoryError.value = resolveStandardizedErrorMessage(
+        error,
+        'Failed to update memory opt-out state.'
+      )
+      emitShellEvent('session-error', {
+        stage: 'memory_opt_out_put',
+        scope: 'memory-governance'
+      })
+      throw error
+    }
+  }
+
+  function resolveMemoryIntentTags(): string[] {
+    const messages = resolveSessionMessages(session.value)
+    const latestUserMessage = [...messages]
+      .reverse()
+      .find((message) => asString(message.role) === 'user')
+    const text =
+      asString(latestUserMessage?.text) ??
+      asString(latestUserMessage?.message) ??
+      ''
+    const token = text
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, ' ')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)[0]
+    return token ? [token] : ['canvas_execution']
+  }
+
+  async function queryMemoryForCurrentSession() {
+    const currentSessionId = sessionId.value
+    if (!currentSessionId) {
+      throw new Error('Session id is required before memory query.')
+    }
+
+    syncGovernanceIdentityFromContext()
+    memoryState.value = 'loading'
+    clearMemoryError()
+
+    try {
+      const response = await queryAgentMemory(
+        {
+          workspace_id: governanceWorkspaceId.value,
+          principal_id: governancePrincipalId.value,
+          session_id: currentSessionId,
+          intent_tags: resolveMemoryIntentTags()
+        },
+        buildRequestContext()
+      )
+      memoryQuery.value = response
+      memoryState.value = 'ready'
+      emitShellEvent('memory-query-completed', {
+        query_id: response.query_id,
+        candidate_count: response.candidates.length,
+        retrieval_bypassed: response.policy_applied.retrieval_bypassed
+      })
+      recordActionAudit('memory_query', {
+        reason: 'memory_query',
+        riskLevel: 'low',
+        traceRef: response.query_id
+      })
+      return response
+    } catch (error) {
+      memoryState.value = 'error'
+      memoryError.value = resolveStandardizedErrorMessage(
+        error,
+        'Failed to query memory candidates.'
+      )
+      emitShellEvent('session-error', {
+        stage: 'memory_query',
+        scope: 'memory-governance'
+      })
+      throw error
+    }
+  }
+
+  async function refreshMemoryDeleteStatus(
+    targetDeleteJobId = memoryDeleteStatus.value?.delete_job_id
+  ) {
+    if (!targetDeleteJobId) {
+      throw new Error('Delete job id is required before delete status refresh.')
+    }
+
+    memoryState.value = 'loading'
+    clearMemoryError()
+
+    try {
+      const response = await getAgentMemoryDeleteStatus(
+        targetDeleteJobId,
+        buildRequestContext()
+      )
+      memoryDeleteStatus.value = response
+      memoryState.value = 'ready'
+      emitShellEvent('memory-delete-status-observed', {
+        delete_job_id: response.delete_job_id,
+        status: response.status
+      })
+      return response
+    } catch (error) {
+      memoryState.value = 'error'
+      memoryError.value = resolveStandardizedErrorMessage(
+        error,
+        'Failed to refresh memory delete status.'
+      )
+      emitShellEvent('session-error', {
+        stage: 'memory_delete_status',
+        scope: 'memory-governance'
+      })
+      throw error
+    }
+  }
+
+  async function requestMemoryDelete(reason?: string) {
+    syncGovernanceIdentityFromContext()
+    memoryState.value = 'loading'
+    clearMemoryError()
+
+    try {
+      const response = await requestAgentMemoryDelete(
+        {
+          workspace_id: governanceWorkspaceId.value,
+          principal_id: governancePrincipalId.value,
+          delete_scope: 'user',
+          reason: reason ?? 'privacy_cleanup_request'
+        },
+        buildRequestContext()
+      )
+      memoryDeleteStatus.value = {
+        delete_job_id: response.delete_job_id,
+        status: response.status,
+        requested_scope: response.requested_scope,
+        accepted_at: response.accepted_at,
+        updated_at: response.accepted_at,
+        deleted_records_count: 0,
+        index_pruned_count: 0
+      }
+      memoryState.value = 'ready'
+      emitShellEvent('memory-delete-requested', {
+        delete_job_id: response.delete_job_id,
+        scope: response.requested_scope
+      })
+      recordActionAudit('memory_delete', {
+        reason: reason?.trim() || 'memory_delete',
+        riskLevel: 'medium',
+        requiresConfirmation: true,
+        traceRef: response.delete_job_id
+      })
+      return response
+    } catch (error) {
+      memoryState.value = 'error'
+      memoryError.value = resolveStandardizedErrorMessage(
+        error,
+        'Failed to request memory delete.'
+      )
+      emitShellEvent('session-error', {
+        stage: 'memory_delete',
+        scope: 'memory-governance'
+      })
+      throw error
+    }
   }
 
   async function estimateComfyWorkflowExecution() {
@@ -718,6 +1436,9 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     clearExecutionError()
     executionEstimate.value = null
     executionConfirmationAccepted.value = false
+    policyGateState.value = 'idle'
+    policyGateError.value = null
+    policyGate.value = null
     clearDiagnosisState()
     clearReviewState()
 
@@ -737,6 +1458,11 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
       )
       executionEstimate.value = response
       executionState.value = 'estimate-ready'
+      try {
+        await refreshPolicyGate('execution')
+      } catch {
+        // keep estimate usable even when support explain API is temporarily unavailable
+      }
       emitShellEvent('job-estimated', {
         workflow_id: resolvedWorkflowId,
         estimated_price: response.estimate.estimated_price
@@ -802,6 +1528,11 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     if (!executionConfirmationAccepted.value) {
       throw new Error('Confirm execution before submit.')
     }
+    if (policyGateBlocked.value && policyGateVerdict.value) {
+      throw new Error(
+        toPolicyBlockedReason(policyGateVerdict.value as PolicyBlockedVerdict)
+      )
+    }
 
     executionState.value = 'submitting'
     clearExecutionError()
@@ -810,6 +1541,10 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
 
     try {
       assertSessionRevisionUpToDate()
+      const confirmationReason = resolveActionReason('submit_execution', {
+        required: highRiskGateReasonRequired.value,
+        fallbackReason: `submit_execution:${resolvedWorkflowId}`
+      })
       const accepted = await createAgentJob(
         {
           mode: 'comfy_workflow',
@@ -831,7 +1566,18 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
       emitShellEvent('job-submitted', {
         job_id: accepted.job_id,
         workflow_id: resolvedWorkflowId,
-        status: accepted.status
+        status: accepted.status,
+        confirmation_reason: confirmationReason,
+        policy_verdict: policyGateVerdict.value
+      })
+      recordActionAudit('submit_execution', {
+        reason: confirmationReason,
+        riskLevel: highRiskGateReasonRequired.value ? 'high' : 'low',
+        requiresConfirmation: highRiskGateReasonRequired.value,
+        traceRef: accepted.job_id,
+        metadata: {
+          policy_verdict: policyGateVerdict.value
+        }
       })
 
       await observeExecutionJob(accepted.job_id)
@@ -1042,10 +1788,23 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
       throw new Error('No rollback version target is available.')
     }
 
-    return rollbackToWorkflowVersion(
+    const resolvedReason = resolveActionReason('revert_from_diagnosis_or_review', {
+      required: highRiskRevertReasonRequired.value,
+      fallbackReason: `diagnose_or_review_revert:${targetVersionId}`
+    })
+    const response = await rollbackToWorkflowVersion(
       targetVersionId,
-      `diagnose_or_review_revert:${targetVersionId}`
+      resolvedReason
     )
+    recordActionAudit('revert_from_diagnosis_or_review', {
+      reason: resolvedReason,
+      riskLevel:
+        diagnosis.value?.risk.level ??
+        (highRiskRevertReasonRequired.value ? 'high' : 'low'),
+      requiresConfirmation: highRiskRevertReasonRequired.value,
+      traceRef: targetVersionId
+    })
+    return response
   }
 
   async function confirmSessionAction(
@@ -1126,10 +1885,14 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
       throw new Error('No next workflow version candidate is available.')
     }
 
+    const resolvedReason =
+      reason ??
+      resolveActionReason('accept_next_workflow_version', {
+        required: highRiskVersionReasonRequired.value,
+        fallbackReason: `accept_next_workflow_version_candidate:${proposal.candidate_version_id}`
+      })
     const response = await confirmSessionAction(proposal.action_id, {
-      reason:
-        reason ??
-        `accept_next_workflow_version_candidate:${proposal.candidate_version_id}`
+      reason: resolvedReason
     })
     markCurrentWorkflowVersion(proposal.candidate_version_id)
     if (
@@ -1146,7 +1909,14 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     emitShellEvent('workflow-version-candidate-accepted', {
       action_id: proposal.action_id,
       proposal_id: proposal.proposal_id,
-      candidate_version_id: proposal.candidate_version_id
+      candidate_version_id: proposal.candidate_version_id,
+      confirmation_reason: resolvedReason
+    })
+    recordActionAudit('accept_next_workflow_version', {
+      reason: resolvedReason,
+      riskLevel: proposal.risk_level,
+      requiresConfirmation: highRiskVersionReasonRequired.value,
+      traceRef: proposal.proposal_id
     })
     return response
   }
@@ -1157,15 +1927,26 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
       throw new Error('No next workflow version candidate is available.')
     }
 
+    const resolvedReason =
+      reason ??
+      resolveActionReason('reject_next_workflow_version', {
+        required: highRiskVersionReasonRequired.value,
+        fallbackReason: `reject_next_workflow_version_candidate:${proposal.candidate_version_id}`
+      })
     const response = await rejectSessionAction(proposal.action_id, {
-      reason:
-        reason ??
-        `reject_next_workflow_version_candidate:${proposal.candidate_version_id}`
+      reason: resolvedReason
     })
     emitShellEvent('workflow-version-candidate-rejected', {
       action_id: proposal.action_id,
       proposal_id: proposal.proposal_id,
-      candidate_version_id: proposal.candidate_version_id
+      candidate_version_id: proposal.candidate_version_id,
+      confirmation_reason: resolvedReason
+    })
+    recordActionAudit('reject_next_workflow_version', {
+      reason: resolvedReason,
+      riskLevel: proposal.risk_level,
+      requiresConfirmation: highRiskVersionReasonRequired.value,
+      traceRef: proposal.proposal_id
     })
     return response
   }
@@ -1317,6 +2098,25 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     reviewState,
     reviewError,
     review,
+    governanceWorkspaceId,
+    governancePrincipalId,
+    policyGateState,
+    policyGateError,
+    policyGate,
+    policyGateVerdict,
+    policyGateBlocked,
+    standardizedError,
+    memoryState,
+    memoryError,
+    memoryOptOut,
+    memoryOptOutDraft,
+    memoryQuery,
+    memoryDeleteStatus,
+    actionConfirmationReason,
+    actionAuditTrail,
+    highRiskGateReasonRequired,
+    highRiskVersionReasonRequired,
+    highRiskRevertReasonRequired,
     suggestedRevertVersionId,
     eventLog,
     onShellEvent,
@@ -1336,6 +2136,14 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     appendMessage,
     appendUserMessage,
     setExecutionConfirmationAccepted,
+    setActionConfirmationReason,
+    refreshPolicyGate,
+    refreshMemoryOptOutState,
+    setMemoryOptOutFlag,
+    updateMemoryOptOutState,
+    queryMemoryForCurrentSession,
+    requestMemoryDelete,
+    refreshMemoryDeleteStatus,
     estimateComfyWorkflowExecution,
     submitEstimatedExecution,
     refreshExecutionObservation,

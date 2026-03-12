@@ -3,17 +3,24 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   AgentSessionRevisionConflictError,
   appendAgentSessionMessage,
+  askAgentSupport,
   createAgentJob,
   diagnoseAgentExecution,
   estimateAgentJob,
+  explainAgentSupportLimit,
   getAgentJobResult,
+  getAgentMemoryDeleteStatus,
+  getAgentMemoryOptOut,
   getAgentJobStatus,
   getAgentMultimodalReview,
   inspectAgentJob,
   listWorkflowVersions,
+  queryAgentMemory,
+  requestAgentMemoryDelete,
   rollbackWorkflowVersion,
   submitAgentMultimodalReview,
-  switchWorkflowVersion
+  switchWorkflowVersion,
+  updateAgentMemoryOptOut
 } from '@/stores/fluttyAgentSessionApi'
 
 const { mockFetchApi } = vi.hoisted(() => ({
@@ -526,5 +533,247 @@ describe('fluttyAgentSessionApi', () => {
     expect(diagnosis.diagnosis_id).toBe('diag-10d')
     expect(reviewSubmitted.review_id).toBe('review-10d')
     expect(reviewFetched.status).toBe('completed')
+  })
+
+  it('supports entitlement explain + memory opt-out/query/delete endpoints', async () => {
+    mockFetchApi
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          intent_id: 'intent-support',
+          answer_type: 'explanation',
+          summary: 'Policy check completed.',
+          next_steps: [
+            {
+              step_id: 's1',
+              surface: 'web',
+              action: 'Review policy verdict',
+              expected_result: 'Understand current gate',
+              fallback_if_failed: 'Escalate support',
+              requires_confirmation: false
+            }
+          ],
+          entitlement_verdict: 'allow_with_notice',
+          limit_reason: {
+            reason_code: 'soft_notice',
+            title: 'Action allowed with notice',
+            detail: 'Queue depth is non-zero.',
+            notice: 'Execution may be slower than usual.'
+          },
+          required_feature_gates: [],
+          resolved_plan_id: 'creator',
+          resolved_pricing_path: 'auto'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          entitlement_verdict: 'budget_blocked',
+          limit_reason: {
+            reason_code: 'budget_exceeded',
+            title: 'Estimated cost exceeds budget',
+            detail: 'estimated > max_budget',
+            observed: 2.4,
+            limit: 1.0
+          },
+          unblock_options: ['Lower cost settings'],
+          path_specific_cost_explain: 'byok path cost explain',
+          resolved_plan_id: 'creator',
+          resolved_pricing_path: 'byok'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          workspace_id: 'ws-comfyui-canvas',
+          principal_id: 'principal-10e',
+          flags: {
+            learning_opt_out: false,
+            retrieval_opt_out: true,
+            platform_pattern_opt_out: false
+          },
+          effective_at: '2026-03-12T12:20:00.000Z',
+          updated_by: 'principal-10e'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          query_id: 'query-10e',
+          resolved_scopes: ['user'],
+          candidates: [
+            {
+              memory_id: 'mem-1',
+              memory_key: 'style',
+              memory_value: 'cinematic',
+              scope: 'user',
+              memory_source: 'short_term',
+              redaction_level: 'redacted_v1',
+              intent_tags: ['enhance'],
+              style_tags: ['cinematic'],
+              constraint_tags: [],
+              last_used_at: '2026-03-12T12:19:00.000Z'
+            }
+          ],
+          policy_applied: {
+            learning_opt_out: false,
+            retrieval_opt_out: true,
+            platform_pattern_opt_out: false,
+            retrieval_bypassed: false
+          }
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse(
+          {
+            delete_job_id: 'del-10e',
+            status: 'accepted',
+            accepted_at: '2026-03-12T12:21:00.000Z',
+            requested_scope: 'user'
+          },
+          202
+        )
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          delete_job_id: 'del-10e',
+          status: 'running',
+          requested_scope: 'user',
+          accepted_at: '2026-03-12T12:21:00.000Z',
+          updated_at: '2026-03-12T12:21:10.000Z',
+          deleted_records_count: 0,
+          index_pruned_count: 0
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          workspace_id: 'ws-comfyui-canvas',
+          principal_id: 'principal-10e',
+          flags: {
+            learning_opt_out: false,
+            retrieval_opt_out: true,
+            platform_pattern_opt_out: false
+          },
+          effective_at: '2026-03-12T12:20:00.000Z',
+          updated_by: 'principal-10e'
+        })
+      )
+
+    const requestContext = {
+      canvas_context_v1: {
+        schema: 'canvas_context_v1' as const,
+        captured_at: '2026-03-12T12:00:00.000Z',
+        workflow: {
+          path: 'workflows/active.json',
+          revision: 18,
+          digest: 'digest-r18'
+        },
+        selected_nodes: ['2', '5'],
+        viewport: { scale: 1.1, offset: [10, -3] as [number, number] },
+        workspace_id: 'ws-comfyui-canvas',
+        principal_id: 'principal-10e'
+      },
+      session_revision_v1: {
+        workflow_revision: 18,
+        workflow_digest: 'digest-r18'
+      }
+    }
+
+    const ask = await askAgentSupport(
+      {
+        session_id: 'session-10e',
+        workspace_id: 'ws-comfyui-canvas',
+        principal_id: 'principal-10e',
+        user_message: 'Can I run this workflow?',
+        ui_surface: 'web'
+      },
+      requestContext
+    )
+    const explain = await explainAgentSupportLimit(
+      {
+        session_id: 'session-10e',
+        resource_type: 'budget',
+        requested_action: 'submit comfy workflow',
+        current_usage: {
+          max_budget: 1,
+          estimated_price: 2.4
+        },
+        pricing_path: 'byok'
+      },
+      requestContext
+    )
+    const optOutUpdated = await updateAgentMemoryOptOut(
+      {
+        workspace_id: 'ws-comfyui-canvas',
+        principal_id: 'principal-10e',
+        learning_opt_out: false,
+        retrieval_opt_out: true,
+        platform_pattern_opt_out: false
+      },
+      requestContext
+    )
+    const query = await queryAgentMemory(
+      {
+        workspace_id: 'ws-comfyui-canvas',
+        principal_id: 'principal-10e',
+        session_id: 'session-10e',
+        intent_tags: ['enhance']
+      },
+      requestContext
+    )
+    const deleteAccepted = await requestAgentMemoryDelete(
+      {
+        workspace_id: 'ws-comfyui-canvas',
+        principal_id: 'principal-10e',
+        delete_scope: 'user',
+        reason: 'privacy request'
+      },
+      requestContext
+    )
+    const deleteStatus = await getAgentMemoryDeleteStatus('del-10e', requestContext)
+    const optOutState = await getAgentMemoryOptOut(
+      'ws-comfyui-canvas',
+      'principal-10e',
+      requestContext
+    )
+
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      1,
+      '/v1/agent/support/ask',
+      expect.objectContaining({ method: 'POST' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      2,
+      '/v1/agent/support/explain-limit',
+      expect.objectContaining({ method: 'POST' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      3,
+      '/v1/agent/memory/opt-out',
+      expect.objectContaining({ method: 'PUT' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      4,
+      '/v1/agent/memory/query',
+      expect.objectContaining({ method: 'POST' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      5,
+      '/v1/agent/memory/delete',
+      expect.objectContaining({ method: 'POST' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      6,
+      '/v1/agent/memory/delete/del-10e',
+      expect.objectContaining({ method: 'GET' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      7,
+      '/v1/agent/memory/opt-out?workspace_id=ws-comfyui-canvas&principal_id=principal-10e',
+      expect.objectContaining({ method: 'GET' })
+    )
+    expect(ask.entitlement_verdict).toBe('allow_with_notice')
+    expect(explain.entitlement_verdict).toBe('budget_blocked')
+    expect(optOutUpdated.flags.retrieval_opt_out).toBe(true)
+    expect(query.candidates[0].memory_key).toBe('style')
+    expect(deleteAccepted.delete_job_id).toBe('del-10e')
+    expect(deleteStatus.status).toBe('running')
+    expect(optOutState.updated_by).toBe('principal-10e')
   })
 })
