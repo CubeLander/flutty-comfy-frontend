@@ -95,6 +95,7 @@
 
   <!-- Selection rectangle overlay - rendered in DOM layer to appear above DOM widgets -->
   <SelectionRectangle v-if="comfyAppReady" />
+  <FluttyAgentWindowShell />
 
   <NodeTooltip v-if="tooltipEnabled" />
   <NodeSearchboxPopover ref="nodeSearchboxPopoverRef" />
@@ -135,6 +136,7 @@ import GraphCanvasMenu from '@/components/graph/GraphCanvasMenu.vue'
 import LinkOverlayCanvas from '@/components/graph/LinkOverlayCanvas.vue'
 import NodeTooltip from '@/components/graph/NodeTooltip.vue'
 import NodeContextMenu from '@/components/graph/NodeContextMenu.vue'
+import FluttyAgentWindowShell from '@/components/agent/FluttyAgentWindowShell.vue'
 import SelectionToolbox from '@/components/graph/SelectionToolbox.vue'
 import TitleEditor from '@/components/graph/TitleEditor.vue'
 import NodePropertiesPanel from '@/components/rightSidePanel/RightSidePanel.vue'
