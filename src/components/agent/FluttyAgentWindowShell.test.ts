@@ -1,7 +1,7 @@
 import { createTestingPinia } from '@pinia/testing'
 import { mount } from '@vue/test-utils'
 import { setActivePinia } from 'pinia'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { nextTick } from 'vue'
 
 import FluttyAgentWindowShell from '@/components/agent/FluttyAgentWindowShell.vue'
@@ -12,7 +12,7 @@ describe('FluttyAgentWindowShell', () => {
     setActivePinia(createTestingPinia({ stubActions: false }))
   })
 
-  it('renders sections and supports collapse/close toggles', async () => {
+  it('renders conversation shell and supports collapse/close toggles', async () => {
     const pinia = createTestingPinia({ stubActions: false })
     const store = useFluttyAgentWindowStore(pinia)
     store.isOpen = true
@@ -30,10 +30,10 @@ describe('FluttyAgentWindowShell', () => {
       wrapper.find('[data-testid="flutty-agent-session-section"]').exists()
     ).toBe(true)
     expect(
-      wrapper.find('[data-testid="flutty-agent-action-section"]').exists()
+      wrapper.find('[data-testid="flutty-agent-chat-history"]').exists()
     ).toBe(true)
     expect(
-      wrapper.find('[data-testid="flutty-agent-execution-section"]').exists()
+      wrapper.find('[data-testid="flutty-agent-message-input"]').exists()
     ).toBe(true)
 
     await wrapper.find('[data-testid="flutty-agent-collapse"]').trigger('click')
@@ -86,10 +86,9 @@ describe('FluttyAgentWindowShell', () => {
       wrapper.find('[data-testid="flutty-agent-next-version-card"]').exists()
     ).toBe(true)
     expect(wrapper.text()).toContain('version-v2')
-    expect(wrapper.text()).toContain('proposal-1')
   })
 
-  it('renders execution loop controls and diagnose/review cards', async () => {
+  it('renders execution loop controls inside execution panel modal', async () => {
     const pinia = createTestingPinia({ stubActions: false })
     const store = useFluttyAgentWindowStore(pinia)
     store.isOpen = true
@@ -219,6 +218,10 @@ describe('FluttyAgentWindowShell', () => {
     })
 
     await nextTick()
+    await wrapper
+      .find('[data-testid="flutty-agent-open-execution-panel"]')
+      .trigger('click')
+    await nextTick()
 
     expect(
       wrapper.find('[data-testid="flutty-agent-execution-estimate"]').exists()
@@ -234,6 +237,55 @@ describe('FluttyAgentWindowShell', () => {
     )
     expect(wrapper.find('[data-testid="flutty-agent-diagnosis-revert"]').exists()).toBe(
       true
+    )
+  })
+
+  it('shows optimistic user bubble and thinking indicator while waiting for chat response', async () => {
+    const pinia = createTestingPinia({ stubActions: false })
+    const store = useFluttyAgentWindowStore(pinia)
+    store.isOpen = true
+    store.sessionState = 'ready'
+
+    let releaseChatRequest: () => void = () => {}
+    const chatPending = new Promise<void>((resolve) => {
+      releaseChatRequest = () => resolve()
+    })
+
+    vi.spyOn(store, 'appendUserMessage').mockImplementation(async () => {
+      store.sessionState = 'loading'
+      await chatPending
+      store.sessionState = 'ready'
+      return {
+        session_id: 'session-optimistic'
+      } as never
+    })
+
+    const wrapper = mount(FluttyAgentWindowShell, {
+      global: { plugins: [pinia] }
+    })
+
+    await nextTick()
+    await wrapper.find('[data-testid="flutty-agent-message-input"]').setValue('hello')
+    await wrapper.find('[data-testid="flutty-agent-message-send"]').trigger('click')
+    await nextTick()
+
+    expect(wrapper.text()).toContain('hello')
+    expect(
+      wrapper.find('[data-testid="flutty-agent-thinking-indicator"]').exists()
+    ).toBe(true)
+    expect(
+      (
+        wrapper.find('[data-testid="flutty-agent-message-input"]')
+          .element as HTMLTextAreaElement
+      ).value
+    ).toBe('')
+
+    releaseChatRequest()
+    await chatPending
+    await vi.waitFor(() =>
+      expect(
+        wrapper.find('[data-testid="flutty-agent-thinking-indicator"]').exists()
+      ).toBe(false)
     )
   })
 })

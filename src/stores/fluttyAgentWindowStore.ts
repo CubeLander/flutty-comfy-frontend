@@ -6,11 +6,13 @@ import {
   useFluttyCanvasContextV1
 } from '@/composables/useFluttyCanvasContextV1'
 import type {
+  AgentCanvasChatResponseV1,
   AgentDebugDiagnosisEnvelopeV1,
   AgentActionDecisionRequest,
   AgentActionTransitionRecord,
   AgentMessageAppendRequest,
   AgentSessionRecord,
+  JobExecutionEventV1,
   AgentSessionRevisionConflict,
   CaseMemoryDeleteStatusV1,
   CaseMemoryOptOutFlagsV1,
@@ -31,10 +33,10 @@ import type {
 import {
   AgentSessionApiError,
   appendAgentSessionMessage,
+  chatAgentSession,
   confirmAgentAction,
   createAgentJob,
   createAgentSession,
-  createLocalSessionRevisionConflictError,
   diagnoseAgentExecution,
   explainAgentSupportLimit,
   estimateAgentJob,
@@ -172,6 +174,45 @@ export interface NextWorkflowVersionProposal {
   created_at: string | null
 }
 
+export interface ChatWorkflowDraft {
+  workflow: Record<string, unknown>
+  provider: string
+  model: string
+  degraded: boolean
+  received_at: string
+}
+
+interface ToolPlaneWorkflowProposalCandidate {
+  action_id: string
+  proposal_id: string
+  title: string | null
+  summary: string
+  candidate_version_id: string
+  base_revision: number | null
+  workflow_id: string | null
+  risk_level: string | null
+  estimated_cost_band: string | null
+  created_at: string | null
+  requires_confirmation: boolean
+}
+
+interface ToolPlaneWorkflowSwitchSignal {
+  workflow_id: string | null
+  version_id: string
+  reason: string | null
+  at: string | null
+  key: string
+}
+
+interface ToolPlaneExecutionSignal {
+  job_id: string
+  status: JobStatus | null
+  timeline_events: JobExecutionEventV1[]
+  result: Record<string, unknown> | null
+  at: string | null
+  key: string
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   return value as Record<string, unknown>
@@ -183,6 +224,32 @@ function asString(value: unknown): string | null {
 
 function asNumber(value: unknown): number | null {
   return typeof value === 'number' ? value : null
+}
+
+function asBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : []
+}
+
+function normalizeJobStatus(value: unknown): JobStatus | null {
+  if (
+    value !== 'queued' &&
+    value !== 'running' &&
+    value !== 'succeeded' &&
+    value !== 'failed' &&
+    value !== 'canceled'
+  ) {
+    return null
+  }
+  return value
+}
+
+function isAgentSessionNotFoundError(error: AgentSessionApiError): boolean {
+  const detail = asString(asRecord(error.payload)?.detail) ?? ''
+  return detail.includes('agent_session_not_found')
 }
 
 function resolveSessionActions(
@@ -246,6 +313,274 @@ function toNextWorkflowVersionProposal(
       asString(costEstimate?.cost_band),
     created_at: asString(action.created_at)
   }
+}
+
+function collectToolPlaneRecords(root: unknown): Record<string, unknown>[] {
+  const records: Record<string, unknown>[] = []
+  const stack: unknown[] = [root]
+  const seen = new Set<Record<string, unknown>>()
+  const recordKeys = [
+    'session',
+    'tool_plane_v0',
+    'tool_plane',
+    'workflow_proposal_v1',
+    'workflow_version_proposal_v1',
+    'workflow_proposal',
+    'next_workflow_version_v1',
+    'workflow_switch_v1',
+    'workflow_version_switch_v1',
+    'switched_workflow_version_v1',
+    'workflow_switch',
+    'execution_loop_v1',
+    'execution_loop_event_v1',
+    'execution_loop_event',
+    'execution_loop',
+    'execution_event',
+    'execution',
+    'inspect',
+    'result',
+    'audit',
+    'audit_record',
+    'audit_v1'
+  ]
+  const arrayKeys = [
+    'messages',
+    'actions',
+    'tool_events',
+    'events',
+    'execution_loop_events_v1',
+    'execution_events',
+    'timeline'
+  ]
+
+  while (stack.length > 0) {
+    const record = asRecord(stack.pop())
+    if (!record || seen.has(record)) continue
+    seen.add(record)
+    records.push(record)
+
+    for (const key of recordKeys) {
+      stack.push(record[key])
+    }
+    for (const key of arrayKeys) {
+      for (const item of asArray(record[key])) {
+        stack.push(item)
+      }
+    }
+  }
+
+  return records
+}
+
+function extractWorkflowProposalCandidate(
+  record: Record<string, unknown>
+): ToolPlaneWorkflowProposalCandidate | null {
+  const status = asString(record.status)
+  if (status && status !== 'proposed') return null
+
+  const metadata = asRecord(record.metadata)
+  const payload =
+    asRecord(record.next_workflow_version_v1) ??
+    asRecord(record.workflow_proposal_v1) ??
+    asRecord(record.workflow_version_proposal_v1) ??
+    asRecord(record.workflow_proposal) ??
+    asRecord(metadata?.next_workflow_version_v1) ??
+    asRecord(metadata?.workflow_proposal_v1) ??
+    asRecord(metadata?.workflow_version_proposal_v1) ??
+    asRecord(metadata?.workflow_proposal)
+
+  const resolvedPayload =
+    payload ??
+    (asString(record.candidate_version_id) ? record : null) ??
+    (asString(metadata?.candidate_version_id) ? metadata : null)
+  if (!resolvedPayload) return null
+
+  const candidateVersionId =
+    asString(resolvedPayload.candidate_version_id) ??
+    asString(resolvedPayload.version_id) ??
+    asString(resolvedPayload.workflow_version_id)
+  if (!candidateVersionId) return null
+
+  const actionId =
+    asString(resolvedPayload.action_id) ??
+    asString(resolvedPayload.source_action_id) ??
+    asString(record.action_id) ??
+    asString(record.id) ??
+    asString(resolvedPayload.proposal_id) ??
+    asString(resolvedPayload.id) ??
+    `tool-proposal-${candidateVersionId}`
+
+  const summary =
+    asString(resolvedPayload.summary) ??
+    asString(resolvedPayload.description) ??
+    asString(record.description) ??
+    asString(record.title) ??
+    'Agent provided a next workflow version candidate.'
+
+  return {
+    action_id: actionId,
+    proposal_id: asString(resolvedPayload.proposal_id) ?? actionId,
+    title: asString(resolvedPayload.title) ?? asString(record.title),
+    summary,
+    candidate_version_id: candidateVersionId,
+    base_revision:
+      asNumber(resolvedPayload.base_revision) ??
+      asNumber(resolvedPayload.workflow_revision),
+    workflow_id:
+      asString(resolvedPayload.workflow_id) ??
+      asString(resolvedPayload.workflow_path),
+    risk_level: asString(resolvedPayload.risk_level),
+    estimated_cost_band:
+      asString(resolvedPayload.estimated_cost_band) ??
+      asString(resolvedPayload.cost_band),
+    created_at:
+      asString(resolvedPayload.created_at) ??
+      asString(record.created_at) ??
+      asString(record.updated_at),
+    requires_confirmation:
+      asBoolean(resolvedPayload.requires_confirmation) ??
+      asBoolean(asRecord(record.confirmation)?.requires_confirmation) ??
+      true
+  }
+}
+
+function extractWorkflowSwitchSignal(
+  record: Record<string, unknown>
+): ToolPlaneWorkflowSwitchSignal | null {
+  const metadata = asRecord(record.metadata)
+  const payload =
+    asRecord(record.workflow_switch_v1) ??
+    asRecord(record.workflow_version_switch_v1) ??
+    asRecord(record.switched_workflow_version_v1) ??
+    asRecord(record.workflow_switch) ??
+    asRecord(metadata?.workflow_switch_v1) ??
+    asRecord(metadata?.workflow_version_switch_v1) ??
+    asRecord(metadata?.switched_workflow_version_v1) ??
+    asRecord(metadata?.workflow_switch)
+
+  const resolvedPayload = payload ?? (asString(record.switched_to_version_id) ? record : null)
+  if (!resolvedPayload) return null
+
+  const versionId =
+    asString(resolvedPayload.version_id) ??
+    asString(resolvedPayload.workflow_version_id) ??
+    asString(resolvedPayload.switched_to_version_id) ??
+    asString(resolvedPayload.current_version_id) ??
+    asString(resolvedPayload.rolled_back_to_version_id)
+  if (!versionId) return null
+
+  const workflowId =
+    asString(resolvedPayload.workflow_id) ??
+    asString(resolvedPayload.workflow_path) ??
+    asString(record.workflow_id)
+  const reason =
+    asString(resolvedPayload.reason) ??
+    asString(resolvedPayload.switch_reason) ??
+    asString(resolvedPayload.summary)
+  const at =
+    asString(resolvedPayload.recorded_at) ??
+    asString(resolvedPayload.updated_at) ??
+    asString(resolvedPayload.created_at)
+  const key = [workflowId ?? '', versionId, reason ?? '', at ?? ''].join('|')
+
+  return {
+    workflow_id: workflowId,
+    version_id: versionId,
+    reason,
+    at,
+    key
+  }
+}
+
+function toTimelineEvent(value: unknown): JobExecutionEventV1 | null {
+  const record = asRecord(value)
+  if (!record) return null
+  const recordedAt = asString(record.recorded_at) ?? asString(record.at)
+  const phase = asString(record.phase)
+  const message = asString(record.message) ?? asString(record.event)
+  if (!recordedAt || !phase || !message) return null
+
+  return {
+    recorded_at: recordedAt,
+    phase,
+    message,
+    details: asRecord(record.details)
+  }
+}
+
+function extractExecutionSignal(
+  record: Record<string, unknown>
+): ToolPlaneExecutionSignal | null {
+  const metadata = asRecord(record.metadata)
+  const executionRef = asRecord(record.execution_ref)
+  const payload =
+    asRecord(record.execution_loop_event_v1) ??
+    asRecord(record.execution_loop_event) ??
+    asRecord(record.execution_loop_v1) ??
+    asRecord(record.execution_event) ??
+    asRecord(record.execution_loop) ??
+    asRecord(record.execution) ??
+    asRecord(metadata?.execution_loop_event_v1) ??
+    asRecord(metadata?.execution_loop_event) ??
+    asRecord(metadata?.execution_loop_v1) ??
+    asRecord(metadata?.execution_event) ??
+    asRecord(metadata?.execution_loop) ??
+    asRecord(metadata?.execution)
+
+  const resolvedPayload = payload ?? record
+  const jobId =
+    asString(resolvedPayload.job_id) ??
+    asString(resolvedPayload.execution_job_id) ??
+    asString(executionRef?.job_id)
+  if (!jobId) return null
+
+  const status =
+    normalizeJobStatus(asString(resolvedPayload.job_status)) ??
+    normalizeJobStatus(asString(resolvedPayload.status))
+  const at =
+    asString(resolvedPayload.recorded_at) ??
+    asString(resolvedPayload.updated_at) ??
+    asString(resolvedPayload.created_at)
+  const timelineEvents = asArray(resolvedPayload.timeline)
+    .map((entry) => toTimelineEvent(entry))
+    .filter((entry): entry is JobExecutionEventV1 => entry !== null)
+  const inlineEvent = toTimelineEvent(resolvedPayload.timeline_event)
+  if (inlineEvent) {
+    timelineEvents.push(inlineEvent)
+  } else {
+    const fallbackInlineEvent = toTimelineEvent(resolvedPayload)
+    if (fallbackInlineEvent) {
+      timelineEvents.push(fallbackInlineEvent)
+    }
+  }
+
+  const resultPayload = asRecord(resolvedPayload.result)
+  const key = [jobId, status ?? '', at ?? '', String(timelineEvents.length)].join('|')
+
+  return {
+    job_id: jobId,
+    status,
+    timeline_events: timelineEvents,
+    result: resultPayload,
+    at,
+    key
+  }
+}
+
+function extractAuditPayload(record: Record<string, unknown>): Record<string, unknown> | null {
+  const metadata = asRecord(record.metadata)
+  return (
+    asRecord(record.audit) ??
+    asRecord(record.audit_v1) ??
+    asRecord(record.audit_event) ??
+    asRecord(record.audit_record) ??
+    asRecord(record.audit_record_v1) ??
+    asRecord(metadata?.audit) ??
+    asRecord(metadata?.audit_v1) ??
+    asRecord(metadata?.audit_event) ??
+    asRecord(metadata?.audit_record) ??
+    asRecord(metadata?.audit_record_v1)
+  )
 }
 
 function resolveSessionMessages(
@@ -419,6 +754,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
   const workflowId = ref<string | null>(captureCanvasContextV1().workflow.path)
   const currentWorkflowVersionId = ref<string | null>(null)
   const workflowVersions = ref<WorkflowVersionRecord[]>([])
+  const latestChatWorkflow = ref<ChatWorkflowDraft | null>(null)
   const executionState = ref<JobExecutionState>('idle')
   const executionError = ref<string | null>(null)
   const executionEstimate = ref<JobEstimateResponseV1 | null>(null)
@@ -456,6 +792,9 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
   const memoryDeleteStatus = ref<CaseMemoryDeleteStatusV1 | null>(null)
   const actionConfirmationReason = ref('')
   const actionAuditTrail = ref<ActionAuditRecord[]>([])
+  const seenAuditRecordIds = new Set<string>()
+  const seenWorkflowSwitchSignals = new Set<string>()
+  const seenExecutionSignals = new Set<string>()
 
   const nextWorkflowVersionProposal = computed<NextWorkflowVersionProposal | null>(
     () => {
@@ -553,8 +892,292 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     return () => eventSubscribers.delete(subscriber)
   }
 
+  function upsertSessionActionEntry(updatedAction: Record<string, unknown>) {
+    const updatedActionId = asString(updatedAction.action_id)
+    if (!updatedActionId || !session.value) return
+
+    const nextActions = Array.isArray(session.value.actions)
+      ? [...session.value.actions]
+      : []
+    const existingIndex = nextActions.findIndex(
+      (entry) => asString(asRecord(entry)?.action_id) === updatedActionId
+    )
+
+    if (existingIndex >= 0) {
+      nextActions[existingIndex] = {
+        ...(asRecord(nextActions[existingIndex]) ?? {}),
+        ...updatedAction
+      }
+    } else {
+      nextActions.unshift(updatedAction)
+    }
+
+    session.value = {
+      ...session.value,
+      actions: nextActions
+    }
+  }
+
+  function mergeTimelineEvents(
+    current: JobExecutionEventV1[],
+    incoming: JobExecutionEventV1[]
+  ): JobExecutionEventV1[] {
+    const merged: JobExecutionEventV1[] = []
+    const seenKeys = new Set<string>()
+    for (const event of [...current, ...incoming]) {
+      const key = `${event.recorded_at}|${event.phase}|${event.message}`
+      if (seenKeys.has(key)) continue
+      seenKeys.add(key)
+      merged.push(event)
+    }
+    return merged
+  }
+
+  function applyToolPlaneWorkflowProposal(
+    candidate: ToolPlaneWorkflowProposalCandidate
+  ) {
+    if (!session.value) return
+    const existingAction = resolveSessionActions(session.value).find(
+      (action) => asString(action.action_id) === candidate.action_id
+    )
+    const existingStatus = asString(existingAction?.status)
+    if (existingStatus && existingStatus !== 'proposed') {
+      return
+    }
+
+    if (candidate.workflow_id) {
+      workflowId.value = candidate.workflow_id
+    }
+
+    upsertSessionActionEntry({
+      action_id: candidate.action_id,
+      action_type: 'workflow_patch',
+      title: candidate.title ?? 'Apply next workflow version',
+      description: candidate.summary,
+      status: 'proposed',
+      confirmation: {
+        requires_confirmation: candidate.requires_confirmation,
+        risk_level: candidate.risk_level ?? 'medium'
+      },
+      execution_ref: {
+        workflow_id: candidate.workflow_id,
+        workflow_version_id: candidate.candidate_version_id
+      },
+      metadata: {
+        next_workflow_version_v1: {
+          proposal_id: candidate.proposal_id,
+          workflow_id: candidate.workflow_id,
+          base_revision: candidate.base_revision,
+          candidate_version_id: candidate.candidate_version_id,
+          summary: candidate.summary,
+          risk_level: candidate.risk_level,
+          estimated_cost_band: candidate.estimated_cost_band,
+          created_at: candidate.created_at
+        }
+      }
+    })
+  }
+
+  function applyToolPlaneWorkflowSwitch(signal: ToolPlaneWorkflowSwitchSignal) {
+    if (seenWorkflowSwitchSignals.has(signal.key)) return
+    seenWorkflowSwitchSignals.add(signal.key)
+
+    if (signal.workflow_id) {
+      workflowId.value = signal.workflow_id
+    }
+    markCurrentWorkflowVersion(signal.version_id)
+    emitShellEvent('workflow-version-switched', {
+      workflow_id: signal.workflow_id ?? workflowId.value,
+      version_id: signal.version_id,
+      reason: signal.reason,
+      source: 'tool-plane',
+      recorded_at: signal.at
+    })
+  }
+
+  function applyToolPlaneExecutionSignal(signal: ToolPlaneExecutionSignal) {
+    if (seenExecutionSignals.has(signal.key)) return
+    const hasExecutionDetail =
+      signal.status !== null ||
+      signal.timeline_events.length > 0 ||
+      signal.result !== null
+    if (!hasExecutionDetail) return
+    seenExecutionSignals.add(signal.key)
+
+    const now = signal.at ?? new Date().toISOString()
+    activeJobId.value = signal.job_id
+
+    if (signal.status) {
+      activeJobStatus.value = signal.status
+      executionState.value = mapJobStatusToExecutionState(signal.status)
+      jobStatus.value = {
+        job_id: signal.job_id,
+        status: signal.status,
+        created_at: jobStatus.value?.created_at ?? now,
+        updated_at: now,
+        error: jobStatus.value?.error ?? null
+      }
+      emitShellEvent('job-status-observed', {
+        job_id: signal.job_id,
+        status: signal.status,
+        source: 'tool-plane'
+      })
+    }
+
+    if (signal.timeline_events.length > 0) {
+      const existingTimeline = jobInspect.value?.timeline ?? []
+      const mergedTimeline = mergeTimelineEvents(
+        existingTimeline,
+        signal.timeline_events
+      )
+      jobInspect.value = {
+        job_id: signal.job_id,
+        status:
+          signal.status ??
+          jobInspect.value?.status ??
+          activeJobStatus.value ??
+          'queued',
+        created_at: jobInspect.value?.created_at ?? now,
+        updated_at: now,
+        mode: jobInspect.value?.mode ?? 'comfy_workflow',
+        workflow_id: jobInspect.value?.workflow_id ?? workflowId.value ?? null,
+        flow_uri: jobInspect.value?.flow_uri ?? null,
+        output_node_ids: jobInspect.value?.output_node_ids ?? [],
+        request_summary: jobInspect.value?.request_summary ?? {},
+        runtime_route: jobInspect.value?.runtime_route ?? {},
+        compile_report: jobInspect.value?.compile_report ?? null,
+        current_phase: jobInspect.value?.current_phase ?? null,
+        timeline: mergedTimeline,
+        error: jobInspect.value?.error ?? null
+      }
+      emitShellEvent('job-inspect-observed', {
+        job_id: signal.job_id,
+        timeline_size: mergedTimeline.length,
+        source: 'tool-plane'
+      })
+    }
+
+    if (signal.result) {
+      jobResult.value = {
+        job_id: signal.job_id,
+        status: signal.status ?? activeJobStatus.value ?? 'running',
+        created_at: jobResult.value?.created_at ?? now,
+        updated_at: now,
+        result: signal.result,
+        error: jobResult.value?.error ?? null
+      }
+      emitShellEvent('job-result-observed', {
+        job_id: signal.job_id,
+        status: jobResult.value.status,
+        source: 'tool-plane'
+      })
+    }
+  }
+
+  function importAuditRecordFromEntry(
+    entry: Record<string, unknown>,
+    sourceKind: 'message' | 'action' | 'tool-plane'
+  ) {
+    const directAuditId =
+      asString(entry.audit_id) ?? asString(entry.audit_event_id)
+    const auditPayload = extractAuditPayload(entry) ?? (directAuditId ? entry : null)
+    if (!auditPayload && !directAuditId) return
+    const entryId =
+      asString(entry.action_id) ??
+      asString(entry.message_id) ??
+      asString(entry.id) ??
+      newEphemeralId('audit-source')
+    const auditId =
+      asString(auditPayload?.audit_id) ??
+      asString(auditPayload?.audit_event_id) ??
+      directAuditId ??
+      `${sourceKind}:${entryId}`
+    if (seenAuditRecordIds.has(auditId)) return
+
+    const confirmation = asRecord(entry.confirmation)
+    const action =
+      asString(auditPayload?.action) ??
+      asString(auditPayload?.event) ??
+      asString(entry.action_type) ??
+      (sourceKind === 'message'
+        ? `message:${asString(entry.role) ?? 'unknown'}`
+        : sourceKind)
+    const reason =
+      asString(auditPayload?.reason) ??
+      asString(auditPayload?.decision_reason) ??
+      asString(auditPayload?.summary) ??
+      action
+    const traceRef =
+      asString(auditPayload?.trace_ref) ??
+      asString(auditPayload?.trace_id) ??
+      asString(auditPayload?.job_id) ??
+      asString(auditPayload?.action_id) ??
+      asString(asRecord(entry.execution_ref)?.job_id)
+
+    appendAuditRecord({
+      audit_id: auditId,
+      action,
+      reason,
+      risk_level:
+        asString(auditPayload?.risk_level) ??
+        asString(confirmation?.risk_level),
+      requires_confirmation:
+        asBoolean(auditPayload?.requires_confirmation) ??
+        asBoolean(confirmation?.requires_confirmation) ??
+        false,
+      trace_ref: traceRef,
+      at:
+        asString(auditPayload?.recorded_at) ??
+        asString(auditPayload?.at) ??
+        asString(entry.updated_at) ??
+        asString(entry.created_at) ??
+        new Date().toISOString(),
+      metadata: {
+        source_kind: sourceKind,
+        source_entry_id: entryId,
+        audit_payload: auditPayload
+      }
+    })
+  }
+
+  function syncAuditTrailFromSessionEntries() {
+    for (const action of resolveSessionActions(session.value)) {
+      importAuditRecordFromEntry(action, 'action')
+    }
+    for (const message of resolveSessionMessages(session.value)) {
+      importAuditRecordFromEntry(message, 'message')
+    }
+  }
+
+  function reconcileToolPlaneSignals(payload: unknown) {
+    const records = collectToolPlaneRecords(payload)
+    for (const record of records) {
+      const candidate = extractWorkflowProposalCandidate(record)
+      if (candidate) {
+        applyToolPlaneWorkflowProposal(candidate)
+      }
+
+      const workflowSwitch = extractWorkflowSwitchSignal(record)
+      if (workflowSwitch) {
+        applyToolPlaneWorkflowSwitch(workflowSwitch)
+      }
+
+      const executionSignal = extractExecutionSignal(record)
+      if (executionSignal) {
+        applyToolPlaneExecutionSignal(executionSignal)
+      }
+
+      importAuditRecordFromEntry(record, 'tool-plane')
+    }
+    syncAuditTrailFromSessionEntries()
+  }
+
   function clearSessionConflict() {
     sessionConflict.value = null
+  }
+
+  function clearLatestChatWorkflow() {
+    latestChatWorkflow.value = null
   }
 
   function clearWorkflowVersionConflict() {
@@ -583,43 +1206,23 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
   }
 
   function syncWorkflowIdFromContext() {
-    const proposalWorkflowId = nextWorkflowVersionProposal.value?.workflow_id
-    if (proposalWorkflowId) {
-      workflowId.value = proposalWorkflowId
-      return
-    }
-
     const contextWorkflowId = captureCanvasContextV1().workflow.path
     if (contextWorkflowId) {
       workflowId.value = contextWorkflowId
+      return
+    }
+
+    const proposalWorkflowId = nextWorkflowVersionProposal.value?.workflow_id
+    if (proposalWorkflowId) {
+      workflowId.value = proposalWorkflowId
     }
   }
 
   function assertSessionRevisionUpToDate() {
-    const expected = sessionRevisionBinding.value
-    if (!expected) return
-
-    const latest = captureCanvasContextV1()
-    const latestRevision = latest.workflow.revision
-    const latestDigest = latest.workflow.digest
-
-    const revisionMismatch =
-      expected.workflow_revision !== null &&
-      latestRevision !== null &&
-      expected.workflow_revision !== latestRevision
-    const digestMismatch =
-      !!expected.workflow_digest &&
-      !!latestDigest &&
-      expected.workflow_digest !== latestDigest
-
-    if (!revisionMismatch && !digestMismatch) return
-
-    throw createLocalSessionRevisionConflictError({
-      expected_workflow_revision: expected.workflow_revision,
-      actual_workflow_revision: latestRevision,
-      expected_workflow_digest: expected.workflow_digest,
-      actual_workflow_digest: latestDigest
-    })
+    // Session and workflow are decoupled: always refresh request context
+    // from the current canvas rather than blocking on revision mismatch.
+    bindSessionRevision()
+    syncWorkflowIdFromContext()
   }
 
   function buildRequestContext() {
@@ -744,6 +1347,8 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
   }
 
   function appendAuditRecord(record: ActionAuditRecord) {
+    if (seenAuditRecordIds.has(record.audit_id)) return
+    seenAuditRecordIds.add(record.audit_id)
     actionAuditTrail.value.unshift(record)
     if (actionAuditTrail.value.length > 20) {
       actionAuditTrail.value.length = 20
@@ -892,29 +1497,9 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
 
   function applyActionTransition(transition: AgentActionTransitionRecord) {
     const updatedAction = asRecord(transition.action)
-    const updatedActionId = asString(updatedAction?.action_id)
-    if (!updatedAction || !updatedActionId || !session.value) return
-
-    const nextActions = Array.isArray(session.value.actions)
-      ? [...session.value.actions]
-      : []
-
-    const existingIndex = nextActions.findIndex(
-      (entry) => asString(asRecord(entry)?.action_id) === updatedActionId
-    )
-    if (existingIndex >= 0) {
-      nextActions[existingIndex] = {
-        ...(asRecord(nextActions[existingIndex]) ?? {}),
-        ...updatedAction
-      }
-    } else {
-      nextActions.unshift(updatedAction)
-    }
-
-    session.value = {
-      ...session.value,
-      actions: nextActions
-    }
+    if (!updatedAction) return
+    upsertSessionActionEntry(updatedAction)
+    reconcileToolPlaneSignals(updatedAction)
   }
 
   function bringToFront() {
@@ -939,8 +1524,8 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
   async function openWindow() {
     isOpen.value = true
     bringToFront()
+    syncWorkflowIdFromContext()
     emitShellEvent('window-opened')
-    await ensureSessionReady()
     try {
       await refreshMemoryOptOutState()
     } catch {
@@ -992,7 +1577,9 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
       )
       sessionId.value = created.session_id
       session.value = created
+      reconcileToolPlaneSignals(created)
       sessionState.value = 'ready'
+      clearLatestChatWorkflow()
       bindSessionRevision()
       syncWorkflowIdFromContext()
       syncGovernanceIdentityFromContext()
@@ -1018,6 +1605,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
       const fetched = await getAgentSession(targetSessionId, buildRequestContext())
       sessionId.value = fetched.session_id
       session.value = fetched
+      reconcileToolPlaneSignals(fetched)
       sessionState.value = 'ready'
       bindSessionRevision()
       syncWorkflowIdFromContext()
@@ -1043,10 +1631,14 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     return fetchSession(created.session_id)
   }
 
-  async function appendMessage(request: AgentMessageAppendRequest) {
-    const currentSessionId = sessionId.value
+  async function appendMessage(
+    request: AgentMessageAppendRequest,
+    allowSessionRecovery = true
+  ) {
+    let currentSessionId = sessionId.value
     if (!currentSessionId) {
-      throw new Error('Session id is required for appendMessage.')
+      const created = await createSession()
+      currentSessionId = created.session_id
     }
 
     sessionState.value = 'loading'
@@ -1071,25 +1663,108 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
       )
 
       session.value = appended
+      reconcileToolPlaneSignals(appended)
       sessionState.value = 'ready'
+      clearLatestChatWorkflow()
       bindSessionRevision()
       syncWorkflowIdFromContext()
       emitShellEvent('session-message-appended', { session_id: currentSessionId })
       return appended
     } catch (error) {
+      if (
+        allowSessionRecovery &&
+        error instanceof AgentSessionApiError &&
+        error.status === 404 &&
+        isAgentSessionNotFoundError(error)
+      ) {
+        await createSession()
+        return appendMessage(request, false)
+      }
       handleSessionError('append_message', error, 'Failed to append message.')
       throw error
     }
   }
 
-  async function appendUserMessage(text: string) {
-    return appendMessage({
-      role: 'user',
-      text
-    })
+  async function appendUserMessage(
+    text: string,
+    options?: {
+      workflow?: Record<string, unknown> | null
+      model?: string | null
+      temperature?: number
+    },
+    allowSessionRecovery = true
+  ) {
+    let currentSessionId = sessionId.value
+    if (!currentSessionId) {
+      const created = await createSession()
+      currentSessionId = created.session_id
+    }
+
+    sessionState.value = 'loading'
+    sessionError.value = null
+    clearSessionConflict()
+
+    try {
+      assertSessionRevisionUpToDate()
+      syncWorkflowIdFromContext()
+      const requestContext = buildRequestContext()
+      const chatResponse: AgentCanvasChatResponseV1 = await chatAgentSession(
+        currentSessionId,
+        {
+          user_message: text,
+          workflow_id: workflowId.value ?? undefined,
+          workflow: options?.workflow ?? undefined,
+          model: options?.model ?? undefined,
+          temperature: options?.temperature
+        },
+        requestContext
+      )
+      session.value = chatResponse.session
+      reconcileToolPlaneSignals(chatResponse)
+      sessionState.value = 'ready'
+      if (
+        chatResponse.workflow &&
+        typeof chatResponse.workflow === 'object' &&
+        !Array.isArray(chatResponse.workflow)
+      ) {
+        latestChatWorkflow.value = {
+          workflow: chatResponse.workflow,
+          provider: chatResponse.provider,
+          model: chatResponse.model,
+          degraded: chatResponse.degraded,
+          received_at: new Date().toISOString()
+        }
+      } else {
+        clearLatestChatWorkflow()
+      }
+      bindSessionRevision()
+      syncWorkflowIdFromContext()
+      emitShellEvent('session-message-appended', {
+        session_id: currentSessionId,
+        provider: chatResponse.provider,
+        model: chatResponse.model,
+        degraded: chatResponse.degraded
+      })
+      return chatResponse.session
+    } catch (error) {
+      if (error instanceof AgentSessionApiError && error.status === 404) {
+        if (allowSessionRecovery && isAgentSessionNotFoundError(error)) {
+          await createSession()
+          return appendUserMessage(text, options, false)
+        }
+        return appendMessage({
+          role: 'user',
+          text
+        })
+      }
+      handleSessionError('append_message', error, 'Failed to append message.')
+      throw error
+    }
   }
 
   function resetExecutionLoop() {
+    seenWorkflowSwitchSignals.clear()
+    seenExecutionSignals.clear()
     executionState.value = 'idle'
     executionError.value = null
     executionEstimate.value = null
@@ -2081,6 +2756,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     workflowId,
     currentWorkflowVersionId,
     workflowVersions,
+    latestChatWorkflow,
     executionState,
     executionError,
     executionEstimate,
@@ -2129,6 +2805,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     toggleCollapsed,
     togglePinned,
     setWorkflowVersionTarget,
+    clearLatestChatWorkflow,
     createSession,
     fetchSession,
     ensureSessionReady,

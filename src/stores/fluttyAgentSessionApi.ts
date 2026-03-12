@@ -16,6 +16,104 @@ export interface AgentMessageAppendRequest {
   metadata?: Record<string, unknown>
 }
 
+export interface ToolPlaneAuditEnvelopeV0 {
+  audit_id?: string | null
+  audit_event_id?: string | null
+  action?: string | null
+  reason?: string | null
+  decision_reason?: string | null
+  risk_level?: string | null
+  requires_confirmation?: boolean
+  trace_ref?: string | null
+  trace_id?: string | null
+  recorded_at?: string | null
+  at?: string | null
+  [key: string]: unknown
+}
+
+export interface ToolPlaneWorkflowProposalV0 {
+  action_id?: string | null
+  proposal_id?: string | null
+  workflow_id?: string | null
+  candidate_version_id?: string | null
+  version_id?: string | null
+  base_revision?: number | null
+  workflow_revision?: number | null
+  title?: string | null
+  summary?: string | null
+  description?: string | null
+  risk_level?: string | null
+  estimated_cost_band?: string | null
+  requires_confirmation?: boolean
+  created_at?: string | null
+  [key: string]: unknown
+}
+
+export interface ToolPlaneWorkflowSwitchV0 {
+  workflow_id?: string | null
+  workflow_version_id?: string | null
+  switched_to_version_id?: string | null
+  rolled_back_to_version_id?: string | null
+  current_version_id?: string | null
+  reason?: string | null
+  switch_reason?: string | null
+  recorded_at?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+  [key: string]: unknown
+}
+
+export interface ToolPlaneExecutionLoopEventV0 {
+  job_id?: string | null
+  execution_job_id?: string | null
+  status?: JobStatus | string | null
+  job_status?: JobStatus | string | null
+  recorded_at?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+  phase?: string | null
+  message?: string | null
+  event?: string | null
+  details?: Record<string, unknown> | null
+  timeline_event?: Record<string, unknown> | null
+  timeline?: Array<Record<string, unknown>>
+  result?: Record<string, unknown> | null
+  [key: string]: unknown
+}
+
+export interface AgentToolPlaneEnvelopeV0 {
+  workflow_proposal?: ToolPlaneWorkflowProposalV0 | null
+  workflow_switch?: ToolPlaneWorkflowSwitchV0 | null
+  execution_loop_event?: ToolPlaneExecutionLoopEventV0 | null
+  execution_loop_events?: ToolPlaneExecutionLoopEventV0[] | null
+  audit?: ToolPlaneAuditEnvelopeV0 | null
+  [key: string]: unknown
+}
+
+export interface AgentCanvasChatRequestV1 {
+  user_message: string
+  workflow?: Record<string, unknown> | null
+  workflow_id?: string | null
+  model?: string | null
+  temperature?: number
+}
+
+export interface AgentCanvasChatResponseV1 {
+  session: AgentSessionRecord
+  assistant_text: string
+  workflow?: Record<string, unknown> | null
+  provider: string
+  model: string
+  degraded: boolean
+  message_entry?: Record<string, unknown> | null
+  action_entry?: Record<string, unknown> | null
+  tool_plane_v0?: AgentToolPlaneEnvelopeV0 | null
+  workflow_proposal_v1?: ToolPlaneWorkflowProposalV0 | null
+  workflow_switch_v1?: ToolPlaneWorkflowSwitchV0 | null
+  execution_loop_event_v1?: ToolPlaneExecutionLoopEventV0 | null
+  audit?: ToolPlaneAuditEnvelopeV0 | null
+}
+
 export interface AgentActionDecisionRequest {
   reason?: string
 }
@@ -965,6 +1063,22 @@ export function appendAgentSessionMessage(
 ): Promise<AgentSessionRecord> {
   return requestAgentSessionApi<AgentSessionRecord>(
     `/v1/agent/sessions/${encodeURIComponent(sessionId)}/messages`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    },
+    requestContext
+  )
+}
+
+export function chatAgentSession(
+  sessionId: string,
+  request: AgentCanvasChatRequestV1,
+  requestContext?: AgentSessionRequestContext
+): Promise<AgentCanvasChatResponseV1> {
+  return requestAgentSessionApi<AgentCanvasChatResponseV1>(
+    `/v1/agent/sessions/${encodeURIComponent(sessionId)}/chat`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

@@ -68,6 +68,9 @@ const DEV_SEVER_FALLBACK_URL =
 
 const DEV_SERVER_COMFYUI_URL =
   DEV_SERVER_COMFYUI_ENV_URL || DEV_SEVER_FALLBACK_URL
+const DEV_SERVER_FLUTTY_API_URL =
+  process.env.DEV_SERVER_FLUTTY_API_URL ||
+  (DISTRIBUTION !== 'cloud' ? 'http://127.0.0.1:8111' : undefined)
 
 const cloudProxyConfig =
   DISTRIBUTION === 'cloud' ? { secure: false, changeOrigin: true } : {}
@@ -169,6 +172,16 @@ export default defineConfig({
         ? {
             '/api/view': gcsRedirectProxyConfig,
             '/api/viewvideo': gcsRedirectProxyConfig
+          }
+        : {}),
+
+      ...(DEV_SERVER_FLUTTY_API_URL
+        ? {
+            '/api/v1': {
+              target: DEV_SERVER_FLUTTY_API_URL,
+              rewrite: (path) => path.replace(/^\/api/, ''),
+              ...cloudProxyConfig
+            }
           }
         : {}),
 

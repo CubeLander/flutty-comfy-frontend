@@ -44,6 +44,7 @@
         <SidebarHelpCenterIcon v-if="!isIntegratedTabBar" :is-small="isSmall" />
         <SidebarBottomPanelToggleButton v-if="!isCloud" :is-small="isSmall" />
         <SidebarShortcutsToggleButton :is-small="isSmall" />
+        <SidebarAgentToggleButton />
         <SidebarSettingsButton :is-small="isSmall" />
       </div>
     </div>
@@ -60,6 +61,7 @@ import { useI18n } from 'vue-i18n'
 import HelpCenterPopups from '@/components/helpcenter/HelpCenterPopups.vue'
 import ComfyMenuButton from '@/components/sidebar/ComfyMenuButton.vue'
 import SidebarBottomPanelToggleButton from '@/components/sidebar/SidebarBottomPanelToggleButton.vue'
+import SidebarAgentToggleButton from '@/components/sidebar/SidebarAgentToggleButton.vue'
 import SidebarSettingsButton from '@/components/sidebar/SidebarSettingsButton.vue'
 import SidebarShortcutsToggleButton from '@/components/sidebar/SidebarShortcutsToggleButton.vue'
 import { isCloud } from '@/platform/distribution/types'

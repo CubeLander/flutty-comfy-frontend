@@ -166,7 +166,7 @@ describe('useFluttyAgentWindowStore', () => {
     expect(store.eventLog[0].type).toBe('session-fetched')
   })
 
-  it('injects canvas context and session revision into append message payload', async () => {
+  it('uses chat endpoint and forwards canvas revision headers for user messages', async () => {
     mockFetchApi
       .mockResolvedValueOnce(
         asJsonResponse({
@@ -184,10 +184,20 @@ describe('useFluttyAgentWindowStore', () => {
       )
       .mockResolvedValueOnce(
         asJsonResponse({
-          session_id: 'session-10b',
-          workspace_id: 'ws-comfyui-canvas',
-          messages: [{ message_id: 'm-1' }],
-          actions: []
+          session: {
+            session_id: 'session-10b',
+            workspace_id: 'ws-comfyui-canvas',
+            messages: [
+              { message_id: 'u-1', role: 'user', text: 'hello canvas' },
+              { message_id: 'a-1', role: 'agent', text: 'hello back' }
+            ],
+            actions: []
+          },
+          assistant_text: 'hello back',
+          workflow: null,
+          provider: 'dashscope',
+          model: 'qwen-plus',
+          degraded: false
         })
       )
 
@@ -197,30 +207,109 @@ describe('useFluttyAgentWindowStore', () => {
 
     expect(mockFetchApi).toHaveBeenNthCalledWith(
       3,
-      '/v1/agent/sessions/session-10b/messages',
+      '/v1/agent/sessions/session-10b/chat',
       expect.objectContaining({ method: 'POST' })
     )
 
     const appendPayload = JSON.parse(
       String((mockFetchApi.mock.calls[2][1] as RequestInit).body)
     )
-    expect(appendPayload.metadata.canvas_context_v1).toMatchObject({
-      schema: 'canvas_context_v1',
-      workflow: {
-        revision: 11,
-        digest: 'digest-r11'
-      },
-      selected_nodes: ['4', '8'],
-      workspace_id: 'ws-comfyui-canvas',
-      principal_id: 'principal-10b'
+    expect(appendPayload).toMatchObject({
+      user_message: 'hello canvas',
+      workflow_id: 'workflows/active.json'
     })
-    expect(appendPayload.metadata.session_revision_v1).toEqual({
-      workflow_revision: 11,
-      workflow_digest: 'digest-r11'
-    })
+    expect(mockFetchApi.mock.calls[2][1]).toEqual(
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          'X-Flutty-Session-Workflow-Revision': '11',
+          'X-Flutty-Session-Workflow-Digest': 'digest-r11'
+        })
+      })
+    )
   })
 
-  it('handles revision conflict as recoverable and succeeds after refresh/retry', async () => {
+  it('recreates session and retries chat when backend reports session_not_found', async () => {
+    mockFetchApi
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session_id: 'session-10b',
+          workspace_id: 'ws-comfyui-canvas'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session_id: 'session-10b',
+          workspace_id: 'ws-comfyui-canvas',
+          messages: [],
+          actions: []
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse(
+          {
+            detail: 'agent_session_not_found:session-10b'
+          },
+          404
+        )
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session_id: 'session-10b-new',
+          workspace_id: 'ws-comfyui-canvas'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session: {
+            session_id: 'session-10b-new',
+            workspace_id: 'ws-comfyui-canvas',
+            messages: [
+              {
+                message_id: 'msg-after-recovery-user',
+                role: 'user',
+                text: 'hello after recovery'
+              },
+              {
+                message_id: 'msg-after-recovery-agent',
+                role: 'agent',
+                text: 'session recovered'
+              }
+            ],
+            actions: []
+          },
+          assistant_text: 'session recovered',
+          workflow: null,
+          provider: 'dashscope',
+          model: 'qwen-plus',
+          degraded: false
+        })
+      )
+
+    const store = useFluttyAgentWindowStore()
+    await store.ensureSessionReady()
+    await store.appendUserMessage('hello after recovery')
+
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      3,
+      '/v1/agent/sessions/session-10b/chat',
+      expect.objectContaining({ method: 'POST' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      4,
+      '/v1/agent/sessions',
+      expect.objectContaining({ method: 'POST' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      5,
+      '/v1/agent/sessions/session-10b-new/chat',
+      expect.objectContaining({ method: 'POST' })
+    )
+    expect(store.sessionId).toBe('session-10b-new')
+    expect(store.sessionState).toBe('ready')
+    expect(store.sessionError).toBeNull()
+  })
+
+  it('refreshes request context after workflow revision changes without forcing session refresh', async () => {
     mockFetchApi
       .mockResolvedValueOnce(
         asJsonResponse({
@@ -238,7 +327,69 @@ describe('useFluttyAgentWindowStore', () => {
       )
       .mockResolvedValueOnce(
         asJsonResponse({
-          session_id: 'session-10b',
+          session: {
+            session_id: 'session-10b',
+            workspace_id: 'ws-comfyui-canvas',
+            messages: [
+              {
+                message_id: 'msg-r12-user',
+                role: 'user',
+                text: 'follow latest canvas context'
+              },
+              { message_id: 'msg-r12-agent', role: 'agent', text: 'ack' }
+            ],
+            actions: []
+          },
+          assistant_text: 'ack',
+          workflow: null,
+          provider: 'dashscope',
+          model: 'qwen-plus',
+          degraded: false
+        })
+      )
+
+    const store = useFluttyAgentWindowStore()
+    await store.ensureSessionReady()
+    mockCaptureCanvasContext.mockReturnValue(buildCanvasContext(12, 'digest-r12'))
+    await store.appendUserMessage('follow latest canvas context')
+
+    expect(mockFetchApi).toHaveBeenCalledTimes(3)
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      3,
+      '/v1/agent/sessions/session-10b/chat',
+      expect.objectContaining({ method: 'POST' })
+    )
+    const appendPayload = JSON.parse(
+      String((mockFetchApi.mock.calls[2][1] as RequestInit).body)
+    )
+    expect(appendPayload).toMatchObject({
+      user_message: 'follow latest canvas context',
+      workflow_id: 'workflows/active.json'
+    })
+    expect(mockFetchApi.mock.calls[2][1]).toEqual(
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          'X-Flutty-Session-Workflow-Revision': '12',
+          'X-Flutty-Session-Workflow-Digest': 'digest-r12'
+        })
+      })
+    )
+    expect(store.sessionConflict).toBeNull()
+    expect(store.sessionError).toBeNull()
+    expect(store.sessionState).toBe('ready')
+  })
+
+  it('hydrates next-version proposal from chat tool-plane payload when session actions are absent', async () => {
+    mockFetchApi
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session_id: 'session-10g-c3-proposal',
+          workspace_id: 'ws-comfyui-canvas'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session_id: 'session-10g-c3-proposal',
           workspace_id: 'ws-comfyui-canvas',
           messages: [],
           actions: []
@@ -246,36 +397,193 @@ describe('useFluttyAgentWindowStore', () => {
       )
       .mockResolvedValueOnce(
         asJsonResponse({
-          session_id: 'session-10b',
-          workspace_id: 'ws-comfyui-canvas',
-          messages: [{ message_id: 'retry-1' }],
-          actions: []
+          session: {
+            session_id: 'session-10g-c3-proposal',
+            workspace_id: 'ws-comfyui-canvas',
+            messages: [
+              {
+                message_id: 'msg-tool-proposal',
+                role: 'agent',
+                text: 'I drafted version v3 for your review.'
+              }
+            ],
+            actions: []
+          },
+          assistant_text: 'I drafted version v3 for your review.',
+          workflow: null,
+          provider: 'dashscope',
+          model: 'qwen-plus',
+          degraded: false,
+          tool_plane_v0: {
+            workflow_proposal: {
+              action_id: 'action-tool-v3',
+              proposal_id: 'proposal-v3',
+              workflow_id: 'workflows/active.json',
+              candidate_version_id: 'version-v3',
+              base_revision: 11,
+              summary: 'Improve denoise schedule and preserve seed behavior.',
+              risk_level: 'medium',
+              estimated_cost_band: 'medium',
+              requires_confirmation: true,
+              created_at: '2026-03-12T12:10:00.000Z'
+            }
+          }
         })
       )
 
     const store = useFluttyAgentWindowStore()
     await store.ensureSessionReady()
-    mockCaptureCanvasContext.mockReturnValue(buildCanvasContext(12, 'digest-r12'))
+    await store.appendUserMessage('propose next workflow version')
 
-    await expect(store.appendUserMessage('stale attempt')).rejects.toMatchObject(
-      {
-        name: 'AgentSessionRevisionConflictError'
-      }
+    expect(store.nextWorkflowVersionProposal).toMatchObject({
+      action_id: 'action-tool-v3',
+      proposal_id: 'proposal-v3',
+      candidate_version_id: 'version-v3',
+      workflow_id: 'workflows/active.json'
+    })
+    expect(Array.isArray(store.session?.actions)).toBe(true)
+    expect(store.session?.actions).toHaveLength(1)
+    expect(store.session?.actions?.[0]).toMatchObject({
+      action_id: 'action-tool-v3',
+      status: 'proposed'
+    })
+  })
+
+  it('handles workflow switch + execution loop tool-plane events and imports audit fields', async () => {
+    mockFetchApi
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session_id: 'session-10g-c3-toolplane',
+          workspace_id: 'ws-comfyui-canvas'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session_id: 'session-10g-c3-toolplane',
+          workspace_id: 'ws-comfyui-canvas',
+          messages: [],
+          actions: []
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session: {
+            session_id: 'session-10g-c3-toolplane',
+            workspace_id: 'ws-comfyui-canvas',
+            messages: [
+              {
+                message_id: 'msg-tool-audit',
+                role: 'agent',
+                text: 'Switch accepted, execution is running.',
+                metadata: {
+                  audit_v1: {
+                    audit_id: 'audit-message-1',
+                    action: 'chat_turn',
+                    reason: 'tool plane emitted workflow switch',
+                    risk_level: 'low',
+                    requires_confirmation: false,
+                    trace_ref: 'trace-chat-tool',
+                    recorded_at: '2026-03-12T12:20:00.000Z'
+                  }
+                }
+              }
+            ],
+            actions: [
+              {
+                action_id: 'action-tool-switch',
+                action_type: 'workflow_patch',
+                status: 'confirmed',
+                execution_ref: {
+                  workflow_id: 'workflows/active.json',
+                  workflow_version_id: 'version-v3',
+                  job_id: 'job-tool-1'
+                },
+                confirmation: {
+                  requires_confirmation: true,
+                  risk_level: 'medium'
+                },
+                metadata: {
+                  audit: {
+                    audit_event_id: 'audit-action-1',
+                    action: 'workflow_switch_accept',
+                    reason: 'accepted by tool-plane loop',
+                    risk_level: 'medium',
+                    requires_confirmation: true,
+                    trace_ref: 'job-tool-1',
+                    recorded_at: '2026-03-12T12:20:01.000Z'
+                  }
+                }
+              }
+            ]
+          },
+          assistant_text: 'Switch accepted, execution is running.',
+          workflow: null,
+          provider: 'dashscope',
+          model: 'qwen-plus',
+          degraded: false,
+          tool_plane_v0: {
+            workflow_switch: {
+              workflow_id: 'workflows/active.json',
+              switched_to_version_id: 'version-v3',
+              reason: 'accept_next_workflow_version',
+              recorded_at: '2026-03-12T12:20:02.000Z'
+            },
+            execution_loop_event: {
+              job_id: 'job-tool-1',
+              status: 'running',
+              recorded_at: '2026-03-12T12:20:03.000Z',
+              phase: 'runtime',
+              message: 'execution_running',
+              details: {
+                source: 'langgraph-tool-plane'
+              }
+            },
+            audit: {
+              audit_id: 'audit-top-1',
+              action: 'execution_status',
+              reason: 'runtime moved to running',
+              risk_level: 'low',
+              requires_confirmation: false,
+              trace_ref: 'job-tool-1',
+              recorded_at: '2026-03-12T12:20:03.000Z'
+            }
+          }
+        })
+      )
+
+    const store = useFluttyAgentWindowStore()
+    await store.ensureSessionReady()
+    await store.appendUserMessage('execute with current proposal')
+
+    expect(store.currentWorkflowVersionId).toBe('version-v3')
+    expect(store.activeJobId).toBe('job-tool-1')
+    expect(store.activeJobStatus).toBe('running')
+    expect(store.executionState).toBe('running')
+    expect(store.jobInspect?.timeline).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          phase: 'runtime',
+          message: 'execution_running'
+        })
+      ])
     )
-    expect(mockFetchApi).toHaveBeenCalledTimes(2)
-    expect(store.sessionConflict?.code).toBe('agent_session_revision_conflict')
-    expect(store.sessionError).toContain('Refresh session context and retry.')
-
-    await store.fetchSession()
-    await store.appendUserMessage('retry after refresh')
-
-    expect(mockFetchApi).toHaveBeenCalledTimes(4)
-    expect(mockFetchApi).toHaveBeenNthCalledWith(
-      4,
-      '/v1/agent/sessions/session-10b/messages',
-      expect.objectContaining({ method: 'POST' })
+    expect(store.actionAuditTrail.map((entry) => entry.audit_id)).toEqual(
+      expect.arrayContaining(['audit-message-1', 'audit-action-1', 'audit-top-1'])
     )
-    expect(store.sessionState).toBe('ready')
+    expect(
+      store.eventLog.some(
+        (event) =>
+          event.type === 'workflow-version-switched' &&
+          event.payload?.source === 'tool-plane'
+      )
+    ).toBe(true)
+    expect(
+      store.eventLog.some(
+        (event) =>
+          event.type === 'job-status-observed' &&
+          event.payload?.source === 'tool-plane'
+      )
+    ).toBe(true)
   })
 
   it('parses and accepts next workflow version candidate', async () => {
@@ -767,10 +1075,17 @@ describe('useFluttyAgentWindowStore', () => {
       )
       .mockResolvedValueOnce(
         asJsonResponse({
-          session_id: 'session-10d-fail',
-          workspace_id: 'ws-comfyui-canvas',
-          messages: [{ message_id: 'msg-10d-next' }],
-          actions: [buildNextVersionAction('proposed')]
+          session: {
+            session_id: 'session-10d-fail',
+            workspace_id: 'ws-comfyui-canvas',
+            messages: [{ message_id: 'msg-10d-next' }],
+            actions: [buildNextVersionAction('proposed')]
+          },
+          assistant_text: 'proposed next version',
+          workflow: null,
+          provider: 'dashscope',
+          model: 'qwen-plus',
+          degraded: false
         })
       )
       .mockResolvedValueOnce(
@@ -855,10 +1170,17 @@ describe('useFluttyAgentWindowStore', () => {
       )
       .mockResolvedValueOnce(
         asJsonResponse({
-          session_id: 'session-10d-fail',
-          workspace_id: 'ws-comfyui-canvas',
-          messages: [{ message_id: 'msg-10d-next-2' }],
-          actions: [buildNextVersionAction('proposed')]
+          session: {
+            session_id: 'session-10d-fail',
+            workspace_id: 'ws-comfyui-canvas',
+            messages: [{ message_id: 'msg-10d-next-2' }],
+            actions: [buildNextVersionAction('proposed')]
+          },
+          assistant_text: 'proposed next version again',
+          workflow: null,
+          provider: 'dashscope',
+          model: 'qwen-plus',
+          degraded: false
         })
       )
       .mockResolvedValueOnce(
@@ -898,7 +1220,7 @@ describe('useFluttyAgentWindowStore', () => {
     )
     expect(mockFetchApi).toHaveBeenNthCalledWith(
       13,
-      '/v1/agent/sessions/session-10d-fail/messages',
+      '/v1/agent/sessions/session-10d-fail/chat',
       expect.objectContaining({ method: 'POST' })
     )
     expect(mockFetchApi).toHaveBeenNthCalledWith(
