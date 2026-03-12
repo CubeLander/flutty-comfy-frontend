@@ -64,6 +64,327 @@ export interface AgentSessionRequestContext {
   session_revision_v1?: AgentSessionRevisionBindingV1 | null
 }
 
+export type JobExecutionMode = 'template_workflow' | 'comfy_workflow'
+export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled'
+export type ExecutionBackend = 'auto' | 'comfy_bridge' | 'native'
+export type FallbackPolicy = 'allow_bridge' | 'fail_fast'
+export type PricingPath = 'auto' | 'hosted' | 'byok'
+
+export interface TemplateWorkflowJobRequest {
+  prompt: string
+  negative_prompt?: string
+  checkpoint?: string
+  width?: number
+  height?: number
+  batch_size?: number
+  steps?: number
+  cfg_scale?: number
+  seed?: number | null
+  sampler_name?: string
+  scheduler?: string
+  denoise?: number
+  execution_backend?: ExecutionBackend
+  fallback_policy?: FallbackPolicy
+}
+
+export interface CostEstimateV1 {
+  billing_mode: string
+  currency: string
+  estimated_compute_units: number
+  unit_price: number
+  estimated_price: number
+  confidence: string
+  note?: string | null
+}
+
+export interface PricingQuoteV1 {
+  pricing_path: string
+  plan_id: string
+  plan_source: string
+  currency: string
+  included_credits?: number | null
+  overage_unit_price: number
+  concurrency_limit: number
+  queue_tier: string
+  orchestration_fee_rate?: number | null
+  orchestration_fee_floor?: number | null
+}
+
+export interface JobEstimateRequestV1 {
+  mode: JobExecutionMode
+  template_id?: string | null
+  workflow_id?: string | null
+  template_request?: TemplateWorkflowJobRequest | null
+  execution_backend?: ExecutionBackend
+  fallback_policy?: FallbackPolicy
+  user_tier?: string
+  plan_id_hint?: string | null
+  pricing_path?: PricingPath
+  currency?: string
+  max_budget?: number | null
+  idempotency_key?: string | null
+  artifact_ids?: string[]
+}
+
+export interface JobEstimateResponseV1 {
+  mode: JobExecutionMode
+  workflow_id?: string | null
+  template_id?: string | null
+  pricing: PricingQuoteV1
+  estimate: CostEstimateV1
+}
+
+export interface JobCreateRequestV1 extends JobEstimateRequestV1 {}
+
+export interface JobCreateResponseV1 {
+  job_id: string
+  status: JobStatus
+  created_at: string
+  mode: JobExecutionMode
+  workflow_id?: string | null
+  template_id?: string | null
+  pricing: PricingQuoteV1
+  estimate?: CostEstimateV1 | null
+}
+
+export interface JobErrorV1 {
+  code: string
+  message: string
+  details?: Record<string, unknown> | null
+}
+
+export interface JobExecutionEventV1 {
+  recorded_at: string
+  phase: string
+  message: string
+  details?: Record<string, unknown> | null
+}
+
+export interface JobStatusResponseV1 {
+  job_id: string
+  status: JobStatus
+  created_at: string
+  updated_at: string
+  error?: JobErrorV1 | null
+}
+
+export interface JobInspectResponseV1 {
+  job_id: string
+  status: JobStatus
+  created_at: string
+  updated_at: string
+  mode: JobExecutionMode
+  workflow_id?: string | null
+  flow_uri?: string | null
+  output_node_ids: string[]
+  request_summary: Record<string, unknown>
+  runtime_route: Record<string, unknown>
+  compile_report?: Record<string, unknown> | null
+  current_phase?: string | null
+  timeline: JobExecutionEventV1[]
+  error?: JobErrorV1 | null
+}
+
+export interface JobResultResponseV1 {
+  job_id: string
+  status: JobStatus
+  created_at: string
+  updated_at: string
+  result?: Record<string, unknown> | null
+  error?: JobErrorV1 | null
+}
+
+export interface AgentDebugDiagnoseRequestV1 {
+  job_id: string
+  session_id?: string
+  action_id?: string
+  workflow_id?: string
+  workflow_version_id?: string
+  include_patch_handoff?: boolean
+  max_root_causes?: number
+  max_suggested_fixes?: number
+}
+
+export interface AgentDebugEvidenceRefV1 {
+  ref_id: string
+  source: string
+  signal: string
+  phase?: string | null
+}
+
+export interface AgentDebugRootCauseV1 {
+  cause_id: string
+  stage: 'compile' | 'runtime' | 'policy'
+  error_code: string
+  category: 'compatibility' | 'resource' | 'policy' | 'data' | 'unknown'
+  hypothesis: string
+  evidence_ref_ids: string[]
+  confidence_score: number
+  blocking: boolean
+}
+
+export interface AgentDebugSuggestedFixV1 {
+  fix_id: string
+  cause_ids: string[]
+  fix_kind:
+    | 'workflow_patch'
+    | 'parameter_adjust'
+    | 'retry'
+    | 'policy_or_plan_adjust'
+    | 'manual_investigation'
+  patchable: boolean
+  requires_confirmation: boolean
+  risk_level: 'low' | 'medium' | 'high' | 'critical'
+  steps: string[]
+  expected_effect: string
+  rollback_hint?: string | null
+}
+
+export interface AgentDebugPatchIntentV1 {
+  cause_id: string
+  source_fix_id: string
+  operations_hint: string[]
+}
+
+export interface AgentDebugPatchHandoffV1 {
+  handoff_version: string
+  source_diagnosis_id: string
+  source_job_id: string
+  target_workflow_id?: string | null
+  target_workflow_version_id?: string | null
+  patch_intents: AgentDebugPatchIntentV1[]
+  confirmation: {
+    risk_level: 'low' | 'medium' | 'high' | 'critical'
+    requires_confirmation: boolean
+  }
+  confidence_score: number
+  evidence_refs: AgentDebugEvidenceRefV1[]
+}
+
+export interface AgentDebugDiagnosisEnvelopeV1 {
+  diagnosis_id: string
+  job_id: string
+  session_id?: string | null
+  action_id?: string | null
+  workflow_id?: string | null
+  workflow_version_id?: string | null
+  stage: 'compile' | 'runtime' | 'policy' | 'mixed'
+  summary: {
+    title: string
+    narrative: string
+    impact: 'cannot_run' | 'degraded_quality' | 'cost_risk' | 'policy_blocked'
+    user_action_hint?: string | null
+  }
+  root_causes: AgentDebugRootCauseV1[]
+  suggested_fixes: AgentDebugSuggestedFixV1[]
+  confidence: {
+    overall_score: number
+    signal_coverage: 'low' | 'medium' | 'high'
+    conflict_count: number
+  }
+  risk: {
+    level: 'low' | 'medium' | 'high' | 'critical'
+    dimensions: string[]
+    destructive_change: boolean
+    requires_confirmation: boolean
+  }
+  evidence_refs: AgentDebugEvidenceRefV1[]
+  patch_handoff?: AgentDebugPatchHandoffV1 | null
+  generated_at: string
+}
+
+export type MultimodalReviewRefType = 'image' | 'artifact' | 'log' | 'timeline'
+
+export interface MultimodalReviewRefV1 {
+  ref_id: string
+  ref_type: MultimodalReviewRefType
+  workspace_id: string
+  asset_id?: string | null
+  artifact_id?: string | null
+  artifact_kind?: string | null
+  log_ref?: string | null
+  timeline_ref?: string | null
+  job_id?: string | null
+  node_id?: string | null
+  mime_type?: string | null
+  sha256?: string | null
+  width?: number | null
+  height?: number | null
+  time_range?: Record<string, unknown> | null
+  event_range?: Record<string, unknown> | null
+}
+
+export interface MultimodalReviewRequestV1 {
+  review_id: string
+  session_id: string
+  message_id: string
+  source_action_id: string
+  workspace_id: string
+  workflow_id?: string | null
+  workflow_version?: string | null
+  refs: MultimodalReviewRefV1[]
+  review_focus?: string[]
+  output_locale?: string
+}
+
+export interface MultimodalReviewResponseV1 {
+  review_id: string
+  status: 'completed' | 'rejected' | 'failed'
+  quality_findings: Array<{
+    finding_id: string
+    category: string
+    severity: string
+    summary: string
+    evidence_ref_ids: string[]
+    confidence: number
+  }>
+  probable_causes: Array<{
+    cause_id: string
+    cause_type: string
+    description: string
+    linked_finding_ids: string[]
+    evidence_ref_ids: string[]
+    confidence: number
+  }>
+  recommended_actions: Array<{
+    recommendation_id: string
+    action_kind: string
+    rationale: string
+    linked_finding_ids: string[]
+    linked_cause_ids: string[]
+    risk_level: string
+    requires_confirmation: boolean
+  }>
+  version_assistant_hints: Array<{
+    suggestion_id: string
+    action_kind: 'checkpoint' | 'revert' | 'fork'
+    rationale: string
+    linked_recommendation_id?: string | null
+  }>
+  trace: {
+    trace_id: string
+    session_id: string
+    message_id: string
+    source_action_id: string
+    workspace_id: string
+    resolved_ref_ids: string[]
+    rejected_refs: Array<{
+      ref_id: string
+      error_code: string
+      reason: string
+      request_workspace_id: string
+      ref_workspace_id: string
+    }>
+    review_model_ref: string
+  }
+  generated_at: string
+  error?: {
+    error_code: string
+    reason: string
+    details?: Record<string, unknown> | null
+  } | null
+}
+
 export interface AgentSessionRevisionConflict {
   code: string
   recoverable: boolean
@@ -550,4 +871,118 @@ export async function rollbackWorkflowVersion(
       asString(versionRecord?.id) ??
       versionId
   }
+}
+
+export function estimateAgentJob(
+  request: JobEstimateRequestV1,
+  requestContext?: AgentSessionRequestContext
+): Promise<JobEstimateResponseV1> {
+  return requestAgentSessionApi<JobEstimateResponseV1>(
+    '/v1/jobs/estimate',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    },
+    requestContext,
+    'Job estimate API failed'
+  )
+}
+
+export function createAgentJob(
+  request: JobCreateRequestV1,
+  requestContext?: AgentSessionRequestContext
+): Promise<JobCreateResponseV1> {
+  return requestAgentSessionApi<JobCreateResponseV1>(
+    '/v1/jobs',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    },
+    requestContext,
+    'Job submit API failed'
+  )
+}
+
+export function getAgentJobStatus(
+  jobId: string,
+  requestContext?: AgentSessionRequestContext
+): Promise<JobStatusResponseV1> {
+  return requestAgentSessionApi<JobStatusResponseV1>(
+    `/v1/jobs/${encodeURIComponent(jobId)}`,
+    { method: 'GET' },
+    requestContext,
+    'Job status API failed'
+  )
+}
+
+export function getAgentJobResult(
+  jobId: string,
+  requestContext?: AgentSessionRequestContext
+): Promise<JobResultResponseV1> {
+  return requestAgentSessionApi<JobResultResponseV1>(
+    `/v1/jobs/${encodeURIComponent(jobId)}/result`,
+    { method: 'GET' },
+    requestContext,
+    'Job result API failed'
+  )
+}
+
+export function inspectAgentJob(
+  jobId: string,
+  requestContext?: AgentSessionRequestContext
+): Promise<JobInspectResponseV1> {
+  return requestAgentSessionApi<JobInspectResponseV1>(
+    `/v1/jobs/${encodeURIComponent(jobId)}/inspect`,
+    { method: 'GET' },
+    requestContext,
+    'Job inspect API failed'
+  )
+}
+
+export function diagnoseAgentExecution(
+  request: AgentDebugDiagnoseRequestV1,
+  requestContext?: AgentSessionRequestContext
+): Promise<AgentDebugDiagnosisEnvelopeV1> {
+  return requestAgentSessionApi<AgentDebugDiagnosisEnvelopeV1>(
+    '/v1/agent/debug/diagnose',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    },
+    requestContext,
+    'Agent diagnose API failed'
+  )
+}
+
+export function submitAgentMultimodalReview(
+  sessionId: string,
+  request: MultimodalReviewRequestV1,
+  requestContext?: AgentSessionRequestContext
+): Promise<MultimodalReviewResponseV1> {
+  return requestAgentSessionApi<MultimodalReviewResponseV1>(
+    `/v1/agent/sessions/${encodeURIComponent(sessionId)}/reviews/multimodal`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    },
+    requestContext,
+    'Multimodal review API failed'
+  )
+}
+
+export function getAgentMultimodalReview(
+  sessionId: string,
+  reviewId: string,
+  requestContext?: AgentSessionRequestContext
+): Promise<MultimodalReviewResponseV1> {
+  return requestAgentSessionApi<MultimodalReviewResponseV1>(
+    `/v1/agent/sessions/${encodeURIComponent(sessionId)}/reviews/${encodeURIComponent(reviewId)}`,
+    { method: 'GET' },
+    requestContext,
+    'Multimodal review API failed'
+  )
 }

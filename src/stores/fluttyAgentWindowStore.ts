@@ -6,24 +6,41 @@ import {
   useFluttyCanvasContextV1
 } from '@/composables/useFluttyCanvasContextV1'
 import type {
+  AgentDebugDiagnosisEnvelopeV1,
   AgentActionDecisionRequest,
   AgentActionTransitionRecord,
   AgentMessageAppendRequest,
   AgentSessionRecord,
   AgentSessionRevisionConflict,
+  JobEstimateResponseV1,
+  JobInspectResponseV1,
+  JobResultResponseV1,
+  JobStatus,
+  JobStatusResponseV1,
+  MultimodalReviewRequestV1,
+  MultimodalReviewResponseV1,
   WorkflowVersionListResponse,
   WorkflowVersionRecord
 } from '@/stores/fluttyAgentSessionApi'
 import {
+  AgentSessionApiError,
   appendAgentSessionMessage,
   confirmAgentAction,
+  createAgentJob,
   createAgentSession,
   createLocalSessionRevisionConflictError,
+  diagnoseAgentExecution,
+  estimateAgentJob,
+  getAgentJobResult,
+  getAgentJobStatus,
+  getAgentMultimodalReview,
   getAgentSession,
+  inspectAgentJob,
   isAgentSessionRevisionConflictError,
   listWorkflowVersions,
   rejectAgentAction,
   rollbackWorkflowVersion as rollbackWorkflowVersionApi,
+  submitAgentMultimodalReview,
   switchWorkflowVersion as switchWorkflowVersionApi
 } from '@/stores/fluttyAgentSessionApi'
 
@@ -47,6 +64,13 @@ export type FluttyAgentShellEventType =
   | 'session-message-appended'
   | 'session-action-confirmed'
   | 'session-action-rejected'
+  | 'job-estimated'
+  | 'job-submitted'
+  | 'job-status-observed'
+  | 'job-result-observed'
+  | 'job-inspect-observed'
+  | 'job-diagnose-completed'
+  | 'job-review-completed'
   | 'workflow-version-candidate-accepted'
   | 'workflow-version-candidate-rejected'
   | 'workflow-versions-refreshed'
@@ -62,6 +86,19 @@ export interface FluttyAgentShellEvent {
 
 type SessionState = 'idle' | 'creating' | 'loading' | 'ready' | 'error'
 type WorkflowVersionState = 'idle' | 'loading' | 'ready' | 'error'
+type JobExecutionState =
+  | 'idle'
+  | 'estimating'
+  | 'estimate-ready'
+  | 'submitting'
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'canceled'
+  | 'error'
+type DiagnoseState = 'idle' | 'loading' | 'ready' | 'error'
+type ReviewState = 'idle' | 'loading' | 'ready' | 'error'
 
 export interface NextWorkflowVersionProposal {
   action_id: string
@@ -152,6 +189,37 @@ function toNextWorkflowVersionProposal(
   }
 }
 
+function resolveSessionMessages(
+  session: AgentSessionRecord | null
+): Record<string, unknown>[] {
+  if (!Array.isArray(session?.messages)) return []
+  return session.messages
+    .map((message) => asRecord(message))
+    .filter((message): message is Record<string, unknown> => message !== null)
+}
+
+function newEphemeralId(prefix: string): string {
+  const random = Math.random().toString(36).slice(2, 10)
+  return `${prefix}-${Date.now().toString(36)}-${random}`
+}
+
+function mapJobStatusToExecutionState(status: JobStatus): JobExecutionState {
+  switch (status) {
+    case 'queued':
+      return 'queued'
+    case 'running':
+      return 'running'
+    case 'succeeded':
+      return 'succeeded'
+    case 'failed':
+      return 'failed'
+    case 'canceled':
+      return 'canceled'
+    default:
+      return 'error'
+  }
+}
+
 export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => {
   const { captureCanvasContextV1 } = useFluttyCanvasContextV1()
 
@@ -176,6 +244,21 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
   const workflowId = ref<string | null>(captureCanvasContextV1().workflow.path)
   const currentWorkflowVersionId = ref<string | null>(null)
   const workflowVersions = ref<WorkflowVersionRecord[]>([])
+  const executionState = ref<JobExecutionState>('idle')
+  const executionError = ref<string | null>(null)
+  const executionEstimate = ref<JobEstimateResponseV1 | null>(null)
+  const executionConfirmationAccepted = ref(false)
+  const activeJobId = ref<string | null>(null)
+  const activeJobStatus = ref<JobStatus | null>(null)
+  const jobStatus = ref<JobStatusResponseV1 | null>(null)
+  const jobResult = ref<JobResultResponseV1 | null>(null)
+  const jobInspect = ref<JobInspectResponseV1 | null>(null)
+  const diagnoseState = ref<DiagnoseState>('idle')
+  const diagnosisError = ref<string | null>(null)
+  const diagnosis = ref<AgentDebugDiagnosisEnvelopeV1 | null>(null)
+  const reviewState = ref<ReviewState>('idle')
+  const reviewError = ref<string | null>(null)
+  const review = ref<MultimodalReviewResponseV1 | null>(null)
 
   const nextWorkflowVersionProposal = computed<NextWorkflowVersionProposal | null>(
     () => {
@@ -187,6 +270,39 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
       return null
     }
   )
+
+  const canSubmitEstimatedJob = computed(
+    () =>
+      executionState.value === 'estimate-ready' &&
+      executionConfirmationAccepted.value &&
+      !!workflowId.value
+  )
+
+  const canDiagnoseExecution = computed(
+    () =>
+      activeJobStatus.value === 'failed' || activeJobStatus.value === 'canceled'
+  )
+
+  const suggestedRevertVersionId = computed<string | null>(() => {
+    const diagnosisVersionId = asString(
+      asRecord(diagnosis.value?.patch_handoff)?.target_workflow_version_id
+    )
+    if (diagnosisVersionId) return diagnosisVersionId
+
+    const reviewSuggestsRevert =
+      review.value?.recommended_actions.some(
+        (action) => action.action_kind === 'revert'
+      ) ??
+      false
+
+    if (!reviewSuggestsRevert) return null
+
+    return (
+      workflowVersions.value.find(
+        (version) => version.version_id !== currentWorkflowVersionId.value
+      )?.version_id ?? null
+    )
+  })
 
   const eventLog = ref<FluttyAgentShellEvent[]>([])
   const eventSubscribers = new Set<(event: FluttyAgentShellEvent) => void>()
@@ -218,6 +334,22 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
 
   function clearWorkflowVersionConflict() {
     workflowVersionConflict.value = null
+  }
+
+  function clearExecutionError() {
+    executionError.value = null
+  }
+
+  function clearDiagnosisState() {
+    diagnoseState.value = 'idle'
+    diagnosisError.value = null
+    diagnosis.value = null
+  }
+
+  function clearReviewState() {
+    reviewState.value = 'idle'
+    reviewError.value = null
+    review.value = null
   }
 
   function bindSessionRevision() {
@@ -322,6 +454,37 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     })
   }
 
+  function handleExecutionError(
+    stage: string,
+    error: unknown,
+    fallbackMessage: string
+  ) {
+    executionState.value = 'error'
+    executionError.value = error instanceof Error ? error.message : fallbackMessage
+    emitShellEvent('session-error', {
+      stage,
+      scope: 'job-execution'
+    })
+  }
+
+  function handleDiagnoseError(error: unknown, fallbackMessage: string) {
+    diagnoseState.value = 'error'
+    diagnosisError.value = error instanceof Error ? error.message : fallbackMessage
+    emitShellEvent('session-error', {
+      stage: 'job_diagnose',
+      scope: 'job-execution'
+    })
+  }
+
+  function handleReviewError(error: unknown, fallbackMessage: string) {
+    reviewState.value = 'error'
+    reviewError.value = error instanceof Error ? error.message : fallbackMessage
+    emitShellEvent('session-error', {
+      stage: 'job_review',
+      scope: 'job-execution'
+    })
+  }
+
   function markCurrentWorkflowVersion(versionId: string | null) {
     currentWorkflowVersionId.value = versionId
     workflowVersions.value = workflowVersions.value.map((version) => ({
@@ -420,6 +583,7 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     sessionState.value = 'creating'
     sessionError.value = null
     clearSessionConflict()
+    resetExecutionLoop()
 
     try {
       const requestContext = buildRequestContext()
@@ -523,6 +687,365 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
       role: 'user',
       text
     })
+  }
+
+  function resetExecutionLoop() {
+    executionState.value = 'idle'
+    executionError.value = null
+    executionEstimate.value = null
+    executionConfirmationAccepted.value = false
+    activeJobId.value = null
+    activeJobStatus.value = null
+    jobStatus.value = null
+    jobResult.value = null
+    jobInspect.value = null
+    clearDiagnosisState()
+    clearReviewState()
+  }
+
+  function setExecutionConfirmationAccepted(accepted: boolean) {
+    executionConfirmationAccepted.value = accepted
+  }
+
+  async function estimateComfyWorkflowExecution() {
+    syncWorkflowIdFromContext()
+    const resolvedWorkflowId = workflowId.value
+    if (!resolvedWorkflowId) {
+      throw new Error('Workflow id is required before estimate.')
+    }
+
+    executionState.value = 'estimating'
+    clearExecutionError()
+    executionEstimate.value = null
+    executionConfirmationAccepted.value = false
+    clearDiagnosisState()
+    clearReviewState()
+
+    try {
+      assertSessionRevisionUpToDate()
+      const response = await estimateAgentJob(
+        {
+          mode: 'comfy_workflow',
+          workflow_id: resolvedWorkflowId,
+          execution_backend: 'auto',
+          fallback_policy: 'allow_bridge',
+          user_tier: 'standard',
+          pricing_path: 'auto',
+          currency: 'credits'
+        },
+        buildRequestContext()
+      )
+      executionEstimate.value = response
+      executionState.value = 'estimate-ready'
+      emitShellEvent('job-estimated', {
+        workflow_id: resolvedWorkflowId,
+        estimated_price: response.estimate.estimated_price
+      })
+      return response
+    } catch (error) {
+      handleExecutionError('job_estimate', error, 'Failed to estimate job.')
+      throw error
+    }
+  }
+
+  async function observeExecutionJob(jobId: string) {
+    const requestContext = buildRequestContext()
+    const statusResponse = await getAgentJobStatus(jobId, requestContext)
+
+    activeJobId.value = jobId
+    activeJobStatus.value = statusResponse.status
+    jobStatus.value = statusResponse
+    executionState.value = mapJobStatusToExecutionState(statusResponse.status)
+    emitShellEvent('job-status-observed', {
+      job_id: jobId,
+      status: statusResponse.status
+    })
+
+    const inspectResponse = await inspectAgentJob(jobId, requestContext)
+    jobInspect.value = inspectResponse
+    emitShellEvent('job-inspect-observed', {
+      job_id: jobId,
+      timeline_size: inspectResponse.timeline.length
+    })
+
+    if (
+      statusResponse.status === 'succeeded' ||
+      statusResponse.status === 'failed' ||
+      statusResponse.status === 'canceled'
+    ) {
+      try {
+        const resultResponse = await getAgentJobResult(jobId, requestContext)
+        jobResult.value = resultResponse
+        emitShellEvent('job-result-observed', {
+          job_id: jobId,
+          status: resultResponse.status
+        })
+      } catch (error) {
+        if (!(error instanceof AgentSessionApiError) || error.status !== 409) {
+          throw error
+        }
+      }
+    }
+
+    return statusResponse
+  }
+
+  async function submitEstimatedExecution() {
+    syncWorkflowIdFromContext()
+    const resolvedWorkflowId = workflowId.value
+    if (!resolvedWorkflowId) {
+      throw new Error('Workflow id is required before submit.')
+    }
+    if (!executionEstimate.value) {
+      throw new Error('Execution estimate is required before submit.')
+    }
+    if (!executionConfirmationAccepted.value) {
+      throw new Error('Confirm execution before submit.')
+    }
+
+    executionState.value = 'submitting'
+    clearExecutionError()
+    clearDiagnosisState()
+    clearReviewState()
+
+    try {
+      assertSessionRevisionUpToDate()
+      const accepted = await createAgentJob(
+        {
+          mode: 'comfy_workflow',
+          workflow_id: resolvedWorkflowId,
+          execution_backend: 'auto',
+          fallback_policy: 'allow_bridge',
+          user_tier: 'standard',
+          pricing_path: 'auto',
+          currency: executionEstimate.value.pricing.currency,
+          max_budget: executionEstimate.value.estimate.estimated_price,
+          idempotency_key: newEphemeralId('agent-window-job')
+        },
+        buildRequestContext()
+      )
+
+      activeJobId.value = accepted.job_id
+      activeJobStatus.value = accepted.status
+      executionState.value = mapJobStatusToExecutionState(accepted.status)
+      emitShellEvent('job-submitted', {
+        job_id: accepted.job_id,
+        workflow_id: resolvedWorkflowId,
+        status: accepted.status
+      })
+
+      await observeExecutionJob(accepted.job_id)
+      return accepted
+    } catch (error) {
+      handleExecutionError('job_submit', error, 'Failed to submit execution job.')
+      throw error
+    }
+  }
+
+  async function refreshExecutionObservation(targetJobId = activeJobId.value) {
+    if (!targetJobId) {
+      throw new Error('Execution job id is required for status observation.')
+    }
+
+    try {
+      clearExecutionError()
+      return await observeExecutionJob(targetJobId)
+    } catch (error) {
+      handleExecutionError(
+        'job_observe',
+        error,
+        'Failed to observe execution status.'
+      )
+      throw error
+    }
+  }
+
+  async function diagnoseFailedExecution() {
+    const targetJobId = activeJobId.value
+    if (!targetJobId) {
+      throw new Error('Execution job id is required for diagnosis.')
+    }
+    if (!canDiagnoseExecution.value) {
+      throw new Error('Diagnose is available only after failed or canceled execution.')
+    }
+
+    diagnoseState.value = 'loading'
+    diagnosisError.value = null
+
+    try {
+      const response = await diagnoseAgentExecution(
+        {
+          job_id: targetJobId,
+          session_id: sessionId.value ?? undefined,
+          workflow_id: workflowId.value ?? undefined,
+          workflow_version_id: currentWorkflowVersionId.value ?? undefined,
+          include_patch_handoff: true
+        },
+        buildRequestContext()
+      )
+      diagnosis.value = response
+      diagnoseState.value = 'ready'
+      emitShellEvent('job-diagnose-completed', {
+        job_id: targetJobId,
+        diagnosis_id: response.diagnosis_id,
+        stage: response.stage
+      })
+      return response
+    } catch (error) {
+      handleDiagnoseError(error, 'Failed to diagnose execution failure.')
+      throw error
+    }
+  }
+
+  function resolveReviewMessageId() {
+    const messages = resolveSessionMessages(session.value)
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index]
+      const messageId = asString(message.message_id) ?? asString(message.id)
+      if (messageId) return messageId
+    }
+    return newEphemeralId('message')
+  }
+
+  function resolveReviewSourceActionId() {
+    const actions = resolveSessionActions(session.value)
+    for (const action of actions) {
+      const actionId = asString(action.action_id) ?? asString(action.id)
+      if (actionId) return actionId
+    }
+    return nextWorkflowVersionProposal.value?.action_id ?? newEphemeralId('action')
+  }
+
+  function buildExecutionReviewRequest(jobId: string): MultimodalReviewRequestV1 {
+    const currentSessionId = sessionId.value
+    if (!currentSessionId) {
+      throw new Error('Session id is required before review submit.')
+    }
+
+    return {
+      review_id: newEphemeralId(`review-${jobId}`),
+      session_id: currentSessionId,
+      message_id: resolveReviewMessageId(),
+      source_action_id: resolveReviewSourceActionId(),
+      workspace_id: DEFAULT_WORKSPACE_ID,
+      workflow_id: workflowId.value ?? undefined,
+      workflow_version: currentWorkflowVersionId.value ?? undefined,
+      refs: [
+        {
+          ref_id: `${jobId}-timeline`,
+          ref_type: 'timeline',
+          workspace_id: DEFAULT_WORKSPACE_ID,
+          timeline_ref: `/v1/jobs/${jobId}/inspect`,
+          job_id: jobId
+        },
+        {
+          ref_id: `${jobId}-log`,
+          ref_type: 'log',
+          workspace_id: DEFAULT_WORKSPACE_ID,
+          log_ref: `/v1/jobs/${jobId}`,
+          job_id: jobId
+        }
+      ],
+      review_focus: ['runtime_stability', 'quality'],
+      output_locale: 'zh-CN'
+    }
+  }
+
+  async function submitExecutionReview(targetJobId = activeJobId.value) {
+    if (!targetJobId) {
+      throw new Error('Execution job id is required for review submit.')
+    }
+    const currentSessionId = sessionId.value
+    if (!currentSessionId) {
+      throw new Error('Session id is required for review submit.')
+    }
+
+    reviewState.value = 'loading'
+    reviewError.value = null
+
+    try {
+      const request = buildExecutionReviewRequest(targetJobId)
+      const submitted = await submitAgentMultimodalReview(
+        currentSessionId,
+        request,
+        buildRequestContext()
+      )
+
+      let resolved = submitted
+      if (submitted.status !== 'failed') {
+        resolved = await getAgentMultimodalReview(
+          currentSessionId,
+          submitted.review_id,
+          buildRequestContext()
+        )
+      }
+
+      review.value = resolved
+      reviewState.value = 'ready'
+      emitShellEvent('job-review-completed', {
+        job_id: targetJobId,
+        review_id: resolved.review_id,
+        status: resolved.status
+      })
+      return resolved
+    } catch (error) {
+      handleReviewError(error, 'Failed to submit execution review.')
+      throw error
+    }
+  }
+
+  async function requestNextVersionProposalFromDiagnosis() {
+    if (!diagnosis.value) {
+      throw new Error('Diagnose result is required before requesting next version.')
+    }
+
+    const firstFix = diagnosis.value.suggested_fixes[0]
+    const summary = diagnosis.value.summary
+    const guidance = firstFix
+      ? `${firstFix.fix_kind}: ${firstFix.steps.join(' ')}`
+      : 'Provide a safe workflow update based on diagnosis.'
+
+    return appendUserMessage(
+      `Based on diagnosis ${diagnosis.value.diagnosis_id} (${summary.title}), propose next_workflow_version_v1 for workflow ${
+        workflowId.value ?? 'current'
+      }. Guidance: ${guidance}`
+    )
+  }
+
+  async function requestNextVersionProposalFromReview() {
+    if (!review.value) {
+      throw new Error('Review result is required before requesting next version.')
+    }
+
+    const recommendation = review.value.recommended_actions[0]
+    const guidance = recommendation
+      ? `${recommendation.action_kind}: ${recommendation.rationale}`
+      : 'Provide a safe next workflow version proposal based on review.'
+
+    return appendUserMessage(
+      `Based on review ${review.value.review_id}, propose next_workflow_version_v1 for workflow ${
+        workflowId.value ?? 'current'
+      }. Guidance: ${guidance}`
+    )
+  }
+
+  async function revertFromDiagnoseOrReview(versionId = suggestedRevertVersionId.value) {
+    let targetVersionId = versionId
+    if (!targetVersionId) {
+      await refreshWorkflowVersions()
+      targetVersionId =
+        workflowVersions.value.find(
+          (version) => version.version_id !== currentWorkflowVersionId.value
+        )?.version_id ?? null
+    }
+    if (!targetVersionId) {
+      throw new Error('No rollback version target is available.')
+    }
+
+    return rollbackToWorkflowVersion(
+      targetVersionId,
+      `diagnose_or_review_revert:${targetVersionId}`
+    )
   }
 
   async function confirmSessionAction(
@@ -777,6 +1300,24 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     workflowId,
     currentWorkflowVersionId,
     workflowVersions,
+    executionState,
+    executionError,
+    executionEstimate,
+    executionConfirmationAccepted,
+    canSubmitEstimatedJob,
+    activeJobId,
+    activeJobStatus,
+    jobStatus,
+    jobResult,
+    jobInspect,
+    canDiagnoseExecution,
+    diagnoseState,
+    diagnosisError,
+    diagnosis,
+    reviewState,
+    reviewError,
+    review,
+    suggestedRevertVersionId,
     eventLog,
     onShellEvent,
     emitShellEvent,
@@ -794,6 +1335,15 @@ export const useFluttyAgentWindowStore = defineStore('fluttyAgentWindow', () => 
     createAndLoadSession,
     appendMessage,
     appendUserMessage,
+    setExecutionConfirmationAccepted,
+    estimateComfyWorkflowExecution,
+    submitEstimatedExecution,
+    refreshExecutionObservation,
+    diagnoseFailedExecution,
+    submitExecutionReview,
+    requestNextVersionProposalFromDiagnosis,
+    requestNextVersionProposalFromReview,
+    revertFromDiagnoseOrReview,
     confirmSessionAction,
     rejectSessionAction,
     acceptNextWorkflowVersionCandidate,

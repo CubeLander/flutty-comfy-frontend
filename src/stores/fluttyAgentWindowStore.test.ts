@@ -421,6 +421,451 @@ describe('useFluttyAgentWindowStore', () => {
     expect(store.workflowVersions[0].version_id).toBe('version-v1')
   })
 
+  it('runs estimate -> confirm -> submit -> status/result/inspect success loop', async () => {
+    mockFetchApi
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session_id: 'session-10d-success',
+          workspace_id: 'ws-comfyui-canvas'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session_id: 'session-10d-success',
+          workspace_id: 'ws-comfyui-canvas',
+          messages: [],
+          actions: []
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          mode: 'comfy_workflow',
+          workflow_id: 'workflows/active.json',
+          pricing: {
+            pricing_path: 'auto',
+            plan_id: 'standard',
+            plan_source: 'server_resolved',
+            currency: 'credits',
+            overage_unit_price: 1,
+            concurrency_limit: 2,
+            queue_tier: 'standard'
+          },
+          estimate: {
+            billing_mode: 'payg',
+            currency: 'credits',
+            estimated_compute_units: 1.2,
+            unit_price: 1,
+            estimated_price: 1.2,
+            confidence: 'medium'
+          }
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          job_id: 'job-10d-success',
+          status: 'queued',
+          created_at: '2026-03-12T12:00:00.000Z',
+          mode: 'comfy_workflow',
+          workflow_id: 'workflows/active.json',
+          pricing: {
+            pricing_path: 'auto',
+            plan_id: 'standard',
+            plan_source: 'server_resolved',
+            currency: 'credits',
+            overage_unit_price: 1,
+            concurrency_limit: 2,
+            queue_tier: 'standard'
+          }
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          job_id: 'job-10d-success',
+          status: 'succeeded',
+          created_at: '2026-03-12T12:00:00.000Z',
+          updated_at: '2026-03-12T12:01:00.000Z'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          job_id: 'job-10d-success',
+          status: 'succeeded',
+          created_at: '2026-03-12T12:00:00.000Z',
+          updated_at: '2026-03-12T12:01:00.000Z',
+          mode: 'comfy_workflow',
+          workflow_id: 'workflows/active.json',
+          output_node_ids: ['7'],
+          request_summary: {},
+          runtime_route: {},
+          timeline: [
+            {
+              recorded_at: '2026-03-12T12:00:40.000Z',
+              phase: 'runtime',
+              message: 'execution_succeeded'
+            }
+          ]
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          job_id: 'job-10d-success',
+          status: 'succeeded',
+          created_at: '2026-03-12T12:00:00.000Z',
+          updated_at: '2026-03-12T12:01:00.000Z',
+          result: {
+            outputs: [{ node_id: '7' }]
+          }
+        })
+      )
+
+    const store = useFluttyAgentWindowStore()
+    await store.ensureSessionReady()
+
+    await store.estimateComfyWorkflowExecution()
+    expect(store.executionState).toBe('estimate-ready')
+    expect(store.executionEstimate?.estimate.estimated_price).toBe(1.2)
+
+    store.setExecutionConfirmationAccepted(true)
+    await store.submitEstimatedExecution()
+
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      3,
+      '/v1/jobs/estimate',
+      expect.objectContaining({ method: 'POST' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      4,
+      '/v1/jobs',
+      expect.objectContaining({ method: 'POST' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      5,
+      '/v1/jobs/job-10d-success',
+      expect.objectContaining({ method: 'GET' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      6,
+      '/v1/jobs/job-10d-success/inspect',
+      expect.objectContaining({ method: 'GET' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      7,
+      '/v1/jobs/job-10d-success/result',
+      expect.objectContaining({ method: 'GET' })
+    )
+    expect(store.activeJobId).toBe('job-10d-success')
+    expect(store.executionState).toBe('succeeded')
+    expect(store.jobInspect?.timeline).toHaveLength(1)
+    expect(store.jobResult?.status).toBe('succeeded')
+  })
+
+  it('supports failed execution diagnose/review and loops back to next-version/revert', async () => {
+    mockFetchApi
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session_id: 'session-10d-fail',
+          workspace_id: 'ws-comfyui-canvas'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session_id: 'session-10d-fail',
+          workspace_id: 'ws-comfyui-canvas',
+          messages: [{ message_id: 'msg-10d-1' }],
+          actions: [{ action_id: 'action-10d-1' }]
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          mode: 'comfy_workflow',
+          workflow_id: 'workflows/active.json',
+          pricing: {
+            pricing_path: 'auto',
+            plan_id: 'standard',
+            plan_source: 'server_resolved',
+            currency: 'credits',
+            overage_unit_price: 1,
+            concurrency_limit: 2,
+            queue_tier: 'standard'
+          },
+          estimate: {
+            billing_mode: 'payg',
+            currency: 'credits',
+            estimated_compute_units: 2.1,
+            unit_price: 1,
+            estimated_price: 2.1,
+            confidence: 'medium'
+          }
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          job_id: 'job-10d-fail',
+          status: 'queued',
+          created_at: '2026-03-12T12:00:00.000Z',
+          mode: 'comfy_workflow',
+          workflow_id: 'workflows/active.json',
+          pricing: {
+            pricing_path: 'auto',
+            plan_id: 'standard',
+            plan_source: 'server_resolved',
+            currency: 'credits',
+            overage_unit_price: 1,
+            concurrency_limit: 2,
+            queue_tier: 'standard'
+          }
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          job_id: 'job-10d-fail',
+          status: 'failed',
+          created_at: '2026-03-12T12:00:00.000Z',
+          updated_at: '2026-03-12T12:01:00.000Z',
+          error: { code: 'execution_failed', message: 'runtime failure' }
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          job_id: 'job-10d-fail',
+          status: 'failed',
+          created_at: '2026-03-12T12:00:00.000Z',
+          updated_at: '2026-03-12T12:01:00.000Z',
+          mode: 'comfy_workflow',
+          workflow_id: 'workflows/active.json',
+          output_node_ids: [],
+          request_summary: {},
+          runtime_route: {},
+          timeline: [
+            {
+              recorded_at: '2026-03-12T12:00:50.000Z',
+              phase: 'runtime',
+              message: 'execution_failed'
+            }
+          ],
+          error: { code: 'execution_failed', message: 'runtime failure' }
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          job_id: 'job-10d-fail',
+          status: 'failed',
+          created_at: '2026-03-12T12:00:00.000Z',
+          updated_at: '2026-03-12T12:01:00.000Z',
+          result: null,
+          error: { code: 'execution_failed', message: 'runtime failure' }
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          diagnosis_id: 'diag-10d',
+          job_id: 'job-10d-fail',
+          stage: 'runtime',
+          summary: {
+            title: 'Runtime timeout',
+            narrative: 'Execution exceeded timeout budget.',
+            impact: 'cannot_run'
+          },
+          root_causes: [
+            {
+              cause_id: 'cause-timeout',
+              stage: 'runtime',
+              error_code: 'DG-RUN-001',
+              category: 'resource',
+              hypothesis: 'Timeout exceeded',
+              evidence_ref_ids: ['ev-1'],
+              confidence_score: 0.8,
+              blocking: true
+            }
+          ],
+          suggested_fixes: [
+            {
+              fix_id: 'fix-retry',
+              cause_ids: ['cause-timeout'],
+              fix_kind: 'retry',
+              patchable: false,
+              requires_confirmation: false,
+              risk_level: 'medium',
+              steps: ['retry with lower load'],
+              expected_effect: 'runtime success'
+            }
+          ],
+          confidence: {
+            overall_score: 0.8,
+            signal_coverage: 'high',
+            conflict_count: 0
+          },
+          risk: {
+            level: 'medium',
+            dimensions: ['latency'],
+            destructive_change: false,
+            requires_confirmation: false
+          },
+          evidence_refs: [{ ref_id: 'ev-1', source: 'inspect', signal: 'timeout' }],
+          patch_handoff: {
+            handoff_version: 'debug_patch_handoff.v1',
+            source_diagnosis_id: 'diag-10d',
+            source_job_id: 'job-10d-fail',
+            target_workflow_version_id: 'version-v1',
+            patch_intents: [
+              {
+                cause_id: 'cause-timeout',
+                source_fix_id: 'fix-retry',
+                operations_hint: ['retry']
+              }
+            ],
+            confirmation: {
+              risk_level: 'medium',
+              requires_confirmation: false
+            },
+            confidence_score: 0.8,
+            evidence_refs: [{ ref_id: 'ev-1', source: 'inspect', signal: 'timeout' }]
+          },
+          generated_at: '2026-03-12T12:02:00.000Z'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session_id: 'session-10d-fail',
+          workspace_id: 'ws-comfyui-canvas',
+          messages: [{ message_id: 'msg-10d-next' }],
+          actions: [buildNextVersionAction('proposed')]
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          review_id: 'review-10d',
+          status: 'completed',
+          quality_findings: [
+            {
+              finding_id: 'finding-1',
+              category: 'runtime',
+              severity: 'medium',
+              summary: 'One runtime quality concern found.',
+              evidence_ref_ids: ['job-10d-fail-timeline'],
+              confidence: 0.6
+            }
+          ],
+          probable_causes: [],
+          recommended_actions: [
+            {
+              recommendation_id: 'rec-1',
+              action_kind: 'revert',
+              rationale: 'Revert to known stable version.',
+              linked_finding_ids: ['finding-1'],
+              linked_cause_ids: [],
+              risk_level: 'medium',
+              requires_confirmation: true
+            }
+          ],
+          version_assistant_hints: [],
+          trace: {
+            trace_id: 'trace-review-10d',
+            session_id: 'session-10d-fail',
+            message_id: 'msg-10d-1',
+            source_action_id: 'action-10d-1',
+            workspace_id: 'ws-comfyui-canvas',
+            resolved_ref_ids: ['job-10d-fail-timeline'],
+            rejected_refs: [],
+            review_model_ref: 'multimodal-review-v1'
+          },
+          generated_at: '2026-03-12T12:03:00.000Z'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          review_id: 'review-10d',
+          status: 'completed',
+          quality_findings: [
+            {
+              finding_id: 'finding-1',
+              category: 'runtime',
+              severity: 'medium',
+              summary: 'One runtime quality concern found.',
+              evidence_ref_ids: ['job-10d-fail-timeline'],
+              confidence: 0.6
+            }
+          ],
+          probable_causes: [],
+          recommended_actions: [
+            {
+              recommendation_id: 'rec-1',
+              action_kind: 'revert',
+              rationale: 'Revert to known stable version.',
+              linked_finding_ids: ['finding-1'],
+              linked_cause_ids: [],
+              risk_level: 'medium',
+              requires_confirmation: true
+            }
+          ],
+          version_assistant_hints: [],
+          trace: {
+            trace_id: 'trace-review-10d',
+            session_id: 'session-10d-fail',
+            message_id: 'msg-10d-1',
+            source_action_id: 'action-10d-1',
+            workspace_id: 'ws-comfyui-canvas',
+            resolved_ref_ids: ['job-10d-fail-timeline'],
+            rejected_refs: [],
+            review_model_ref: 'multimodal-review-v1'
+          },
+          generated_at: '2026-03-12T12:03:00.000Z'
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          session_id: 'session-10d-fail',
+          workspace_id: 'ws-comfyui-canvas',
+          messages: [{ message_id: 'msg-10d-next-2' }],
+          actions: [buildNextVersionAction('proposed')]
+        })
+      )
+      .mockResolvedValueOnce(
+        asJsonResponse({
+          workflow_id: 'workflows/active.json',
+          rolled_back_to_version_id: 'version-v1',
+          current_version_id: 'version-v1',
+          versions: [{ version_id: 'version-v1' }, { version_id: 'version-v2' }]
+        })
+      )
+
+    const store = useFluttyAgentWindowStore()
+    await store.ensureSessionReady()
+    await store.estimateComfyWorkflowExecution()
+    store.setExecutionConfirmationAccepted(true)
+    await store.submitEstimatedExecution()
+    await store.diagnoseFailedExecution()
+    await store.requestNextVersionProposalFromDiagnosis()
+    await store.submitExecutionReview()
+    await store.requestNextVersionProposalFromReview()
+    await store.revertFromDiagnoseOrReview()
+
+    expect(store.executionState).toBe('failed')
+    expect(store.diagnosis?.diagnosis_id).toBe('diag-10d')
+    expect(store.review?.review_id).toBe('review-10d')
+    expect(store.nextWorkflowVersionProposal?.candidate_version_id).toBe('version-v2')
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      8,
+      '/v1/agent/debug/diagnose',
+      expect.objectContaining({ method: 'POST' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      10,
+      '/v1/agent/sessions/session-10d-fail/reviews/multimodal',
+      expect.objectContaining({ method: 'POST' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      12,
+      '/v1/agent/sessions/session-10d-fail/messages',
+      expect.objectContaining({ method: 'POST' })
+    )
+    expect(mockFetchApi).toHaveBeenNthCalledWith(
+      13,
+      '/v1/workflows/workflows%2Factive.json/versions/version-v1/rollback',
+      expect.objectContaining({ method: 'POST' })
+    )
+  })
+
   it('stores structured conflict when workflow version switch is stale', async () => {
     mockFetchApi
       .mockResolvedValueOnce(

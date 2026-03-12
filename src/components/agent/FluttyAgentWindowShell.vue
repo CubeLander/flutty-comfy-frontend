@@ -163,29 +163,206 @@
               data-testid="flutty-agent-execution-section"
             >
               <div class="mb-2 text-xs font-semibold uppercase tracking-wide">
-                版本区 Versions
+                执行区 Execution
               </div>
-              <div class="space-y-1 text-xs">
+              <div class="space-y-1 text-xs" data-testid="flutty-agent-execution-summary">
                 <div>workflow_id: {{ workflowId ?? 'unbound' }}</div>
-                <div>current_version: {{ currentWorkflowVersionId ?? 'unknown' }}</div>
-                <div>status: {{ workflowVersionState }}</div>
+                <div>execution_state: {{ executionState }}</div>
+                <div>job_id: {{ activeJobId ?? 'not-submitted' }}</div>
+                <div>job_status: {{ activeJobStatus ?? 'unknown' }}</div>
+                <div v-if="executionError" class="text-red-600">
+                  {{ executionError }}
+                </div>
               </div>
               <div
-                v-if="workflowVersionError"
-                class="mt-1 text-[11px] text-red-600"
-                data-testid="flutty-agent-version-error"
+                v-if="executionEstimate"
+                class="mt-2 rounded border border-interface-stroke bg-white/60 p-1.5 text-[11px]"
+                data-testid="flutty-agent-estimate-card"
               >
-                {{ workflowVersionError }}
+                <div>estimate_price: {{ executionEstimate.estimate.estimated_price }}</div>
+                <div>currency: {{ executionEstimate.pricing.currency }}</div>
+                <div>confidence: {{ executionEstimate.estimate.confidence }}</div>
               </div>
+              <label
+                class="mt-2 flex items-center gap-1 text-[11px]"
+                data-testid="flutty-agent-execution-confirm"
+              >
+                <input
+                  type="checkbox"
+                  :checked="executionConfirmationAccepted"
+                  @change="onExecutionConfirmationChange"
+                />
+                <span>确认提交（confirm gate）</span>
+              </label>
+              <div class="mt-2 flex flex-wrap gap-1 text-[11px]">
+                <button
+                  type="button"
+                  class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                  data-testid="flutty-agent-execution-estimate"
+                  :disabled="executionState === 'estimating' || executionState === 'submitting'"
+                  @click="estimateExecution"
+                >
+                  Estimate
+                </button>
+                <button
+                  type="button"
+                  class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                  data-testid="flutty-agent-execution-submit"
+                  :disabled="!canSubmitEstimatedJob || executionState === 'submitting'"
+                  @click="submitExecution"
+                >
+                  Submit
+                </button>
+                <button
+                  type="button"
+                  class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                  data-testid="flutty-agent-execution-refresh"
+                  :disabled="!activeJobId"
+                  @click="refreshExecution"
+                >
+                  Refresh Status
+                </button>
+              </div>
+              <div v-if="jobResultSummary" class="mt-2 text-[11px]">
+                result: {{ jobResultSummary }}
+              </div>
+              <ul v-if="inspectHighlights.length > 0" class="mt-2 space-y-1 text-[11px]">
+                <li
+                  v-for="highlight in inspectHighlights"
+                  :key="highlight.recorded_at + highlight.phase"
+                  class="rounded border border-interface-stroke bg-white/60 px-1.5 py-1"
+                >
+                  <div>{{ highlight.phase }} @ {{ highlight.recorded_at }}</div>
+                  <div class="text-muted-foreground">{{ highlight.message }}</div>
+                </li>
+              </ul>
+
+              <div class="mt-3 border-t border-interface-stroke pt-2">
+                <div class="text-[11px] font-semibold uppercase tracking-wide">
+                  Diagnose / Review
+                </div>
+                <div v-if="diagnosisError" class="mt-1 text-[11px] text-red-600">
+                  {{ diagnosisError }}
+                </div>
+                <div v-if="reviewError" class="mt-1 text-[11px] text-red-600">
+                  {{ reviewError }}
+                </div>
+                <div class="mt-2 flex flex-wrap gap-1 text-[11px]">
+                  <button
+                    type="button"
+                    class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                    data-testid="flutty-agent-diagnose"
+                    :disabled="!canDiagnoseExecution || diagnoseState === 'loading'"
+                    @click="runDiagnose"
+                  >
+                    Diagnose
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                    data-testid="flutty-agent-review-submit"
+                    :disabled="!activeJobId || reviewState === 'loading'"
+                    @click="submitReview"
+                  >
+                    Review
+                  </button>
+                </div>
+              </div>
+
               <div
-                v-if="workflowVersionConflict"
-                class="mt-1 rounded border border-red-200 bg-red-50 p-1 text-[11px] text-red-700"
-                data-testid="flutty-agent-version-conflict"
+                v-if="diagnosis"
+                class="mt-2 rounded border border-interface-stroke bg-white/60 p-1.5 text-[11px]"
+                data-testid="flutty-agent-diagnosis-card"
               >
-                <div>code: {{ workflowVersionConflict.code }}</div>
-                <div>{{ workflowVersionConflict.retry_hint }}</div>
+                <div class="font-medium">{{ diagnosis.summary.title }}</div>
+                <div class="mt-1 text-muted-foreground">
+                  {{ diagnosis.summary.narrative }}
+                </div>
+                <div class="mt-1">stage: {{ diagnosis.stage }}</div>
+                <div class="mt-1">risk: {{ diagnosis.risk.level }}</div>
+                <ul class="mt-1 space-y-1">
+                  <li v-for="cause in diagnosis.root_causes.slice(0, 2)" :key="cause.cause_id">
+                    {{ cause.error_code }} - {{ cause.hypothesis }}
+                  </li>
+                </ul>
+                <div class="mt-1 flex flex-wrap gap-1">
+                  <button
+                    type="button"
+                    class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                    data-testid="flutty-agent-diagnosis-next-version"
+                    :disabled="sessionState === 'loading'"
+                    @click="requestNextVersionFromDiagnosis"
+                  >
+                    Next-Version Proposal
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                    data-testid="flutty-agent-diagnosis-revert"
+                    :disabled="!suggestedRevertVersionId || workflowVersionState === 'loading'"
+                    @click="revertFromDiagnostics"
+                  >
+                    Revert
+                  </button>
+                </div>
               </div>
-              <div class="mt-2">
+
+              <div
+                v-if="review"
+                class="mt-2 rounded border border-interface-stroke bg-white/60 p-1.5 text-[11px]"
+                data-testid="flutty-agent-review-card"
+              >
+                <div class="font-medium">review_id: {{ review.review_id }}</div>
+                <div class="mt-1">status: {{ review.status }}</div>
+                <div
+                  v-if="review.quality_findings.length > 0"
+                  class="mt-1 text-muted-foreground"
+                >
+                  {{ review.quality_findings[0].summary }}
+                </div>
+                <div class="mt-1 flex flex-wrap gap-1">
+                  <button
+                    type="button"
+                    class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                    data-testid="flutty-agent-review-next-version"
+                    :disabled="sessionState === 'loading'"
+                    @click="requestNextVersionFromReview"
+                  >
+                    Next-Version Proposal
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                    data-testid="flutty-agent-review-revert"
+                    :disabled="!suggestedRevertVersionId || workflowVersionState === 'loading'"
+                    @click="revertFromDiagnostics"
+                  >
+                    Revert
+                  </button>
+                </div>
+              </div>
+
+              <div class="mt-3 border-t border-interface-stroke pt-2 text-xs">
+                <div class="mb-1 font-semibold uppercase tracking-wide">版本区 Versions</div>
+                <div class="space-y-1">
+                  <div>current_version: {{ currentWorkflowVersionId ?? 'unknown' }}</div>
+                  <div>version_state: {{ workflowVersionState }}</div>
+                </div>
+                <div
+                  v-if="workflowVersionError"
+                  class="mt-1 text-[11px] text-red-600"
+                  data-testid="flutty-agent-version-error"
+                >
+                  {{ workflowVersionError }}
+                </div>
+                <div
+                  v-if="workflowVersionConflict"
+                  class="mt-1 rounded border border-red-200 bg-red-50 p-1 text-[11px] text-red-700"
+                  data-testid="flutty-agent-version-conflict"
+                >
+                  <div>code: {{ workflowVersionConflict.code }}</div>
+                  <div>{{ workflowVersionConflict.retry_hint }}</div>
+                </div>
                 <button
                   type="button"
                   class="rounded border border-interface-stroke px-2 py-1 text-[11px] hover:bg-black/5 disabled:opacity-50"
@@ -304,6 +481,23 @@ const {
   workflowId,
   currentWorkflowVersionId,
   workflowVersions,
+  executionState,
+  executionError,
+  executionEstimate,
+  executionConfirmationAccepted,
+  canSubmitEstimatedJob,
+  activeJobId,
+  activeJobStatus,
+  jobResult,
+  jobInspect,
+  canDiagnoseExecution,
+  diagnoseState,
+  diagnosisError,
+  diagnosis,
+  reviewState,
+  reviewError,
+  review,
+  suggestedRevertVersionId,
   eventLog
 } = storeToRefs(store)
 
@@ -312,7 +506,16 @@ const {
   setPosition,
   toggleCollapsed,
   togglePinned,
-  closeWindow
+  closeWindow,
+  setExecutionConfirmationAccepted,
+  estimateComfyWorkflowExecution,
+  submitEstimatedExecution,
+  refreshExecutionObservation,
+  diagnoseFailedExecution,
+  submitExecutionReview,
+  requestNextVersionProposalFromDiagnosis,
+  requestNextVersionProposalFromReview,
+  revertFromDiagnoseOrReview
 } = store
 
 const windowStyle = computed(() => ({
@@ -322,6 +525,10 @@ const windowStyle = computed(() => ({
 }))
 
 const stateLabel = computed(() => {
+  if (executionState.value === 'running') return 'running'
+  if (executionState.value === 'failed') return 'failed'
+  if (executionState.value === 'succeeded') return 'succeeded'
+
   switch (sessionState.value) {
     case 'creating':
       return 'creating'
@@ -340,6 +547,29 @@ const latestEventSummary = computed(() => {
   const latest = eventLog.value[0]
   if (!latest) return 'no-event'
   return `${latest.type}@${latest.at}`
+})
+
+const jobResultSummary = computed(() => {
+  if (!jobResult.value) return null
+  const result = jobResult.value.result
+  const resultRecord =
+    result && typeof result === 'object' && !Array.isArray(result)
+      ? (result as Record<string, unknown>)
+      : null
+  const outputs =
+    resultRecord && Array.isArray(resultRecord.outputs)
+      ? resultRecord.outputs.length
+      : 0
+  const images =
+    resultRecord && Array.isArray(resultRecord.images)
+      ? resultRecord.images.length
+      : 0
+  return `status=${jobResult.value.status}, outputs=${outputs}, images=${images}`
+})
+
+const inspectHighlights = computed(() => {
+  if (!Array.isArray(jobInspect.value?.timeline)) return []
+  return jobInspect.value.timeline.slice(-3).reverse()
 })
 
 const clamp = (value: number, min: number, max: number) =>
@@ -407,6 +637,11 @@ function startDrag(event: PointerEvent) {
   window.addEventListener('pointercancel', onPointerUp)
 }
 
+function onExecutionConfirmationChange(event: Event) {
+  const target = event.target as HTMLInputElement | null
+  setExecutionConfirmationAccepted(!!target?.checked)
+}
+
 async function createNewSession() {
   await store.createAndLoadSession()
 }
@@ -421,6 +656,38 @@ async function acceptNextVersion() {
 
 async function rejectNextVersion() {
   await store.rejectNextWorkflowVersionCandidate()
+}
+
+async function estimateExecution() {
+  await estimateComfyWorkflowExecution()
+}
+
+async function submitExecution() {
+  await submitEstimatedExecution()
+}
+
+async function refreshExecution() {
+  await refreshExecutionObservation()
+}
+
+async function runDiagnose() {
+  await diagnoseFailedExecution()
+}
+
+async function submitReview() {
+  await submitExecutionReview()
+}
+
+async function requestNextVersionFromDiagnosis() {
+  await requestNextVersionProposalFromDiagnosis()
+}
+
+async function requestNextVersionFromReview() {
+  await requestNextVersionProposalFromReview()
+}
+
+async function revertFromDiagnostics() {
+  await revertFromDiagnoseOrReview()
 }
 
 async function refreshWorkflowVersions() {
