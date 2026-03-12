@@ -20,6 +20,32 @@ export interface AgentActionDecisionRequest {
   reason?: string
 }
 
+export interface WorkflowVersionDecisionRequest {
+  reason?: string
+}
+
+export interface WorkflowVersionRecord {
+  version_id: string
+  parent_version_id?: string | null
+  created_at?: string | null
+  summary?: string | null
+  label?: string | null
+  is_current?: boolean | null
+  metadata?: Record<string, unknown> | null
+}
+
+export interface WorkflowVersionListResponse {
+  workflow_id: string
+  current_version_id: string | null
+  versions: WorkflowVersionRecord[]
+}
+
+export interface WorkflowVersionTransitionResponse
+  extends WorkflowVersionListResponse {
+  switched_to_version_id?: string | null
+  rolled_back_to_version_id?: string | null
+}
+
 export interface AgentActionTransitionRecord {
   session_id: string
   action: Record<string, unknown>
@@ -101,6 +127,10 @@ function asString(value: unknown): string | null {
 
 function asNumber(value: unknown): number | null {
   return typeof value === 'number' ? value : null
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : []
 }
 
 function toHeadersMap(
@@ -214,10 +244,97 @@ function parseRevisionConflict(
   }
 }
 
+function normalizeWorkflowVersionRecord(
+  raw: unknown,
+  fallbackVersionId: string | null = null
+): WorkflowVersionRecord | null {
+  const record = asRecord(raw)
+  const versionId =
+    asString(record?.version_id) ?? asString(record?.id) ?? fallbackVersionId
+  if (!versionId) return null
+
+  const isCurrentRaw = record?.is_current
+
+  return {
+    version_id: versionId,
+    parent_version_id:
+      asString(record?.parent_version_id) ?? asString(record?.parent_id),
+    created_at: asString(record?.created_at) ?? asString(record?.updated_at),
+    summary:
+      asString(record?.summary) ??
+      asString(record?.description) ??
+      asString(record?.title),
+    label: asString(record?.label) ?? asString(record?.name),
+    is_current: typeof isCurrentRaw === 'boolean' ? isCurrentRaw : null,
+    metadata: asRecord(record?.metadata)
+  }
+}
+
+function normalizeWorkflowVersionResponse(
+  payload: unknown,
+  fallbackWorkflowId: string
+): WorkflowVersionListResponse {
+  const payloadRecord = asRecord(payload)
+  const workflowRecord = asRecord(payloadRecord?.workflow)
+  const workflowId =
+    asString(payloadRecord?.workflow_id) ??
+    asString(workflowRecord?.workflow_id) ??
+    asString(workflowRecord?.id) ??
+    fallbackWorkflowId
+
+  const currentVersionId =
+    asString(payloadRecord?.current_version_id) ??
+    asString(payloadRecord?.active_version_id) ??
+    asString(payloadRecord?.current_version) ??
+    asString(workflowRecord?.current_version_id) ??
+    asString(workflowRecord?.active_version_id)
+
+  const versions = asArray(payloadRecord?.versions)
+    .map((entry) => normalizeWorkflowVersionRecord(entry))
+    .filter((entry): entry is WorkflowVersionRecord => entry !== null)
+
+  const responseVersion = normalizeWorkflowVersionRecord(
+    payloadRecord?.version ?? payloadRecord?.switched_version
+  )
+  if (
+    responseVersion &&
+    !versions.some((entry) => entry.version_id === responseVersion.version_id)
+  ) {
+    versions.unshift(responseVersion)
+  }
+
+  const resolvedCurrentVersionId = currentVersionId ?? responseVersion?.version_id ?? null
+  const normalizedVersions = versions.map((entry) => ({
+    ...entry,
+    is_current: resolvedCurrentVersionId
+      ? entry.version_id === resolvedCurrentVersionId
+      : entry.is_current ?? false
+  }))
+
+  if (
+    resolvedCurrentVersionId &&
+    !normalizedVersions.some(
+      (entry) => entry.version_id === resolvedCurrentVersionId
+    )
+  ) {
+    normalizedVersions.unshift({
+      version_id: resolvedCurrentVersionId,
+      is_current: true
+    })
+  }
+
+  return {
+    workflow_id: workflowId,
+    current_version_id: resolvedCurrentVersionId,
+    versions: normalizedVersions
+  }
+}
+
 async function requestAgentSessionApi<T>(
   route: string,
   init: RequestInit,
-  requestContext?: AgentSessionRequestContext
+  requestContext?: AgentSessionRequestContext,
+  errorPrefix = 'Agent session API failed'
 ): Promise<T> {
   const response = await api.fetchApi(route, withRequestContext(init, requestContext))
   const payload = await parseJsonPayload(response)
@@ -232,7 +349,7 @@ async function requestAgentSessionApi<T>(
       )
     }
     throw new AgentSessionApiError(
-      `Agent session API failed (${response.status})`,
+      `${errorPrefix} (${response.status})`,
       response.status,
       payload
     )
@@ -357,4 +474,80 @@ export function rejectAgentAction(
     request,
     requestContext
   )
+}
+
+function workflowVersionsRoute(workflowId: string): string {
+  return `/v1/workflows/${encodeURIComponent(workflowId)}/versions`
+}
+
+export async function listWorkflowVersions(
+  workflowId: string,
+  requestContext?: AgentSessionRequestContext
+): Promise<WorkflowVersionListResponse> {
+  const payload = await requestAgentSessionApi<unknown>(
+    workflowVersionsRoute(workflowId),
+    { method: 'GET' },
+    requestContext,
+    'Workflow version API failed'
+  )
+  return normalizeWorkflowVersionResponse(payload, workflowId)
+}
+
+export async function switchWorkflowVersion(
+  workflowId: string,
+  versionId: string,
+  request: WorkflowVersionDecisionRequest = {},
+  requestContext?: AgentSessionRequestContext
+): Promise<WorkflowVersionTransitionResponse> {
+  const payload = await requestAgentSessionApi<unknown>(
+    `${workflowVersionsRoute(workflowId)}/${encodeURIComponent(versionId)}/switch`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    },
+    requestContext,
+    'Workflow version API failed'
+  )
+  const normalized = normalizeWorkflowVersionResponse(payload, workflowId)
+  const payloadRecord = asRecord(payload)
+  const versionRecord = asRecord(payloadRecord?.version)
+  return {
+    ...normalized,
+    switched_to_version_id:
+      asString(payloadRecord?.switched_to_version_id) ??
+      asString(versionRecord?.version_id) ??
+      asString(versionRecord?.id) ??
+      versionId
+  }
+}
+
+export async function rollbackWorkflowVersion(
+  workflowId: string,
+  versionId: string,
+  request: WorkflowVersionDecisionRequest = {},
+  requestContext?: AgentSessionRequestContext
+): Promise<WorkflowVersionTransitionResponse> {
+  const payload = await requestAgentSessionApi<unknown>(
+    `${workflowVersionsRoute(workflowId)}/${encodeURIComponent(versionId)}/rollback`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    },
+    requestContext,
+    'Workflow version API failed'
+  )
+  const normalized = normalizeWorkflowVersionResponse(payload, workflowId)
+  const payloadRecord = asRecord(payload)
+  const versionRecord = asRecord(payloadRecord?.version)
+  return {
+    ...normalized,
+    rolled_back_to_version_id:
+      asString(payloadRecord?.rolled_back_to_version_id) ??
+      asString(payloadRecord?.rollback_to_version_id) ??
+      asString(versionRecord?.version_id) ??
+      asString(versionRecord?.id) ??
+      versionId
+  }
 }

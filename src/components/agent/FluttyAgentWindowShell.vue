@@ -93,8 +93,69 @@
               <div class="mb-2 text-xs font-semibold uppercase tracking-wide">
                 动作区 Actions
               </div>
-              <div class="text-xs text-muted-foreground">
-                10a 占位：预留 action list / confirm-reject 入口。
+
+              <div
+                v-if="nextWorkflowVersionProposal"
+                class="space-y-2 text-xs"
+                data-testid="flutty-agent-next-version-card"
+              >
+                <div class="rounded border border-interface-stroke bg-white/60 p-2">
+                  <div class="text-[11px] font-semibold uppercase tracking-wide">
+                    下一版本候选
+                  </div>
+                  <div class="mt-1 font-medium">
+                    {{
+                      nextWorkflowVersionProposal.title ??
+                      nextWorkflowVersionProposal.summary
+                    }}
+                  </div>
+                  <div class="mt-1 text-[11px] text-muted-foreground">
+                    {{ nextWorkflowVersionProposal.summary }}
+                  </div>
+                  <div class="mt-2 space-y-1 text-[11px]">
+                    <div>
+                      candidate_version:
+                      {{ nextWorkflowVersionProposal.candidate_version_id }}
+                    </div>
+                    <div v-if="nextWorkflowVersionProposal.base_revision !== null">
+                      base_revision: {{ nextWorkflowVersionProposal.base_revision }}
+                    </div>
+                    <div>proposal_id: {{ nextWorkflowVersionProposal.proposal_id }}</div>
+                    <div v-if="nextWorkflowVersionProposal.risk_level">
+                      risk: {{ nextWorkflowVersionProposal.risk_level }}
+                    </div>
+                    <div v-if="nextWorkflowVersionProposal.estimated_cost_band">
+                      cost_band: {{ nextWorkflowVersionProposal.estimated_cost_band }}
+                    </div>
+                  </div>
+                  <div class="mt-2 flex gap-2">
+                    <button
+                      type="button"
+                      class="rounded border border-interface-stroke px-2 py-1 text-[11px] hover:bg-black/5 disabled:opacity-50"
+                      :disabled="sessionState === 'loading'"
+                      data-testid="flutty-agent-next-version-accept"
+                      @click="acceptNextVersion"
+                    >
+                      Accept
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded border border-interface-stroke px-2 py-1 text-[11px] hover:bg-black/5 disabled:opacity-50"
+                      :disabled="sessionState === 'loading'"
+                      data-testid="flutty-agent-next-version-reject"
+                      @click="rejectNextVersion"
+                    >
+                      Reject
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div
+                v-else
+                class="text-xs text-muted-foreground"
+                data-testid="flutty-agent-next-version-empty"
+              >
+                当前无“下一版本候选”提案。
               </div>
             </section>
             <section
@@ -102,11 +163,80 @@
               data-testid="flutty-agent-execution-section"
             >
               <div class="mb-2 text-xs font-semibold uppercase tracking-wide">
-                执行区 Execution
+                版本区 Versions
               </div>
-              <div class="text-xs text-muted-foreground">
-                10a 占位：预留 estimate/submit/observe 状态区。
+              <div class="space-y-1 text-xs">
+                <div>workflow_id: {{ workflowId ?? 'unbound' }}</div>
+                <div>current_version: {{ currentWorkflowVersionId ?? 'unknown' }}</div>
+                <div>status: {{ workflowVersionState }}</div>
               </div>
+              <div
+                v-if="workflowVersionError"
+                class="mt-1 text-[11px] text-red-600"
+                data-testid="flutty-agent-version-error"
+              >
+                {{ workflowVersionError }}
+              </div>
+              <div
+                v-if="workflowVersionConflict"
+                class="mt-1 rounded border border-red-200 bg-red-50 p-1 text-[11px] text-red-700"
+                data-testid="flutty-agent-version-conflict"
+              >
+                <div>code: {{ workflowVersionConflict.code }}</div>
+                <div>{{ workflowVersionConflict.retry_hint }}</div>
+              </div>
+              <div class="mt-2">
+                <button
+                  type="button"
+                  class="rounded border border-interface-stroke px-2 py-1 text-[11px] hover:bg-black/5 disabled:opacity-50"
+                  :disabled="workflowVersionState === 'loading'"
+                  data-testid="flutty-agent-version-refresh"
+                  @click="refreshWorkflowVersions"
+                >
+                  Refresh Versions
+                </button>
+              </div>
+              <ul
+                class="mt-2 space-y-2 text-[11px]"
+                data-testid="flutty-agent-version-history"
+              >
+                <li
+                  v-for="version in workflowVersions"
+                  :key="version.version_id"
+                  class="rounded border border-interface-stroke bg-white/60 p-1.5"
+                >
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="truncate">{{ version.version_id }}</span>
+                    <span v-if="version.is_current" class="rounded bg-black/10 px-1 py-0.5">
+                      current
+                    </span>
+                  </div>
+                  <div v-if="version.summary" class="mt-1 text-muted-foreground">
+                    {{ version.summary }}
+                  </div>
+                  <div class="mt-1 flex gap-1">
+                    <button
+                      type="button"
+                      class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                      :disabled="
+                        workflowVersionState === 'loading' ||
+                        version.version_id === currentWorkflowVersionId
+                      "
+                      @click="switchVersion(version.version_id)"
+                    >
+                      Switch
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded border border-interface-stroke px-1.5 py-0.5 hover:bg-black/5 disabled:opacity-50"
+                      :disabled="workflowVersionState === 'loading'"
+                      @click="rollbackVersion(version.version_id)"
+                    >
+                      Rollback
+                    </button>
+                  </div>
+                </li>
+              </ul>
               <div class="mt-2 text-[11px] text-muted-foreground">
                 event_bus: {{ latestEventSummary }}
               </div>
@@ -167,11 +297,23 @@ const {
   session,
   sessionState,
   sessionError,
+  nextWorkflowVersionProposal,
+  workflowVersionState,
+  workflowVersionError,
+  workflowVersionConflict,
+  workflowId,
+  currentWorkflowVersionId,
+  workflowVersions,
   eventLog
 } = storeToRefs(store)
 
-const { bringToFront, setPosition, toggleCollapsed, togglePinned, closeWindow } =
-  store
+const {
+  bringToFront,
+  setPosition,
+  toggleCollapsed,
+  togglePinned,
+  closeWindow
+} = store
 
 const windowStyle = computed(() => ({
   left: `${position.value.x}px`,
@@ -271,6 +413,26 @@ async function createNewSession() {
 
 async function refreshSession() {
   await store.fetchSession()
+}
+
+async function acceptNextVersion() {
+  await store.acceptNextWorkflowVersionCandidate()
+}
+
+async function rejectNextVersion() {
+  await store.rejectNextWorkflowVersionCandidate()
+}
+
+async function refreshWorkflowVersions() {
+  await store.refreshWorkflowVersions()
+}
+
+async function switchVersion(versionId: string) {
+  await store.switchToWorkflowVersion(versionId)
+}
+
+async function rollbackVersion(versionId: string) {
+  await store.rollbackToWorkflowVersion(versionId)
 }
 
 onBeforeUnmount(stopDrag)
