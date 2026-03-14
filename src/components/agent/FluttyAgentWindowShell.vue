@@ -621,15 +621,26 @@ interface ChatModelOption {
 
 const CHAT_MODEL_STORAGE_KEY = 'flutty-agent-chat-model'
 const chatModelOptions: ChatModelOption[] = [
-  { value: 'qwen-plus', label: 'qwen-plus (平衡)' },
-  { value: 'qwen-max', label: 'qwen-max (文字质量)' },
-  { value: 'qwen-turbo', label: 'qwen-turbo (响应速度)' }
+  { value: 'qwen3.5-plus', label: 'qwen3.5-plus (通用推荐)' },
+  { value: 'qwen3.5-flash', label: 'qwen3.5-flash (快速)' },
+  { value: 'qwen3-vl-plus', label: 'qwen3-vl-plus (视觉/视频高质量)' },
+  { value: 'qwen3-vl-flash', label: 'qwen3-vl-flash (视觉/视频快速)' },
+  { value: 'kimi-k2.5', label: 'kimi-k2.5 (长上下文)' }
 ]
+const chatModelOptionValues = new Set(chatModelOptions.map((item) => item.value))
+
+function normalizeSelectedChatModel(model: string | null | undefined): string {
+  const normalized = typeof model === 'string' ? model.trim() : ''
+  if (chatModelOptionValues.has(normalized)) return normalized
+  return chatModelOptions[0].value
+}
 
 const windowRef = ref<HTMLElement | null>(null)
 const dragState = ref<DragState | null>(null)
 const draftMessage = ref('')
-const selectedChatModel = ref<string>(chatModelOptions[0].value)
+const selectedChatModel = ref<string>(
+  normalizeSelectedChatModel(chatModelOptions[0].value)
+)
 const pendingUserMessages = ref<ChatMessageView[]>([])
 const isWaitingAssistantReply = ref(false)
 const isExecutionPanelOpen = ref(false)
@@ -823,18 +834,21 @@ const sendMessageDisabled = computed(
 if (typeof window !== 'undefined') {
   try {
     const savedChatModel = window.localStorage.getItem(CHAT_MODEL_STORAGE_KEY)
-    if (savedChatModel) {
-      selectedChatModel.value = savedChatModel
-    }
+    selectedChatModel.value = normalizeSelectedChatModel(savedChatModel)
   } catch {
     // Ignore persistence read failure.
   }
 }
 
 watch(selectedChatModel, (model) => {
+  const normalized = normalizeSelectedChatModel(model)
+  if (normalized !== model) {
+    selectedChatModel.value = normalized
+    return
+  }
   if (typeof window === 'undefined') return
   try {
-    window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, model)
+    window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, normalized)
   } catch {
     // Ignore persistence write failure.
   }
